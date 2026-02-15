@@ -248,8 +248,10 @@ class ActionClassifier:
             if "args_contain" in pattern:
                 args_str = " ".join(args)
                 full_str = f"{command} {args_str}"
+                import re
                 matched = any(
-                    trigger in full_str for trigger in pattern["args_contain"]
+                    re.search(re.escape(trigger) + r'(\s|$)', full_str)
+                    for trigger in pattern["args_contain"]
                 )
                 if not matched:
                     continue
