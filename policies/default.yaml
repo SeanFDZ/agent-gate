@@ -1,0 +1,124 @@
+# Agent Gate Policy Definition
+# Version: 0.1.0
+# This file defines the complete authority envelope for an agent session.
+
+schema_version: "0.1.0"
+
+gate:
+  name: "default-workspace"
+  description: "Default Agent Gate policy with vault-backed rollback"
+
+# --- ENVELOPE: Where the agent can operate ---
+envelope:
+  allowed_paths:
+    - "${WORKDIR}/**"
+  denied_paths:
+    - "${HOME}/.ssh/**"
+    - "${HOME}/.aws/**"
+    - "${HOME}/.gnupg/**"
+    - "${HOME}/.config/agent-gate/vault/**"
+    - "/etc/**"
+    - "/var/**"
+    - "/usr/**"
+    - "/tmp/.agent-gate-vault/**"
+
+# --- VAULT: Agent-unreachable backup store ---
+vault:
+  path: "${HOME}/.config/agent-gate/vault"
+  retention:
+    max_snapshots_per_file: 20
+    max_age_days: 30
+  naming: "{original_path_hash}/{timestamp}_{filename}"
+  on_failure: "deny"  # If backup fails, block the destructive action
+
+# --- ACTION CLASSIFICATION ---
+actions:
+  destructive:
+    description: "Actions that modify or destroy data. Trigger mandatory vault backup."
+    patterns:
+      - command: "rm"
+        description: "File deletion"
+      - command: "mv"
+        description: "Move/rename — source path ceases to exist"
+      - command: "truncate"
+        description: "File truncation"
+      - command: "write_file"
+        condition: "target_exists"
+        description: "Overwrite existing file"
+      - command: "sed"
+        args_contain: ["-i"]
+        description: "In-place file edit"
+      - command: "chmod"
+        description: "Permission change — backup metadata"
+      - command: "chown"
+        description: "Ownership change — backup metadata"
+      - command: "cp"
+        condition: "target_exists"
+        description: "Copy that overwrites existing target"
+
+  read_only:
+    description: "Non-mutating actions. Auto-allow within envelope."
+    patterns:
+      - command: "cat"
+      - command: "ls"
+      - command: "head"
+      - command: "tail"
+      - command: "grep"
+      - command: "find"
+      - command: "wc"
+      - command: "diff"
+      - command: "read_file"
+      - command: "pwd"
+      - command: "echo"
+      - command: "tree"
+
+  blocked:
+    description: "Hard deny. No override without policy change."
+    patterns:
+      - command: "rm"
+        args_contain: ["-rf /", "-rf ~", "-rf $HOME"]
+        description: "Recursive force delete at root or home"
+      - command: "mkfs"
+        description: "Filesystem format"
+      - command: "dd"
+        description: "Raw disk write"
+      - command: "curl"
+        args_contain: ["| bash", "| sh"]
+        description: "Piped remote execution"
+      - command: "wget"
+        args_contain: ["| bash", "| sh"]
+        description: "Piped remote execution"
+      - command: "shutdown"
+        description: "System shutdown"
+      - command: "reboot"
+        description: "System reboot"
+
+# --- GATE BEHAVIOR ---
+gate_behavior:
+  on_destructive:
+    - "extract_target_paths"
+    - "verify_paths_in_envelope"
+    - "snapshot_targets_to_vault"
+    - "log_action"
+    - "allow_execution"
+
+  on_read_only:
+    - "verify_paths_in_envelope"
+    - "allow_execution"
+
+  on_blocked:
+    - "deny_execution"
+    - "log_attempt"
+    - "return_denial_reason"
+
+  on_unclassified:
+    default: "deny"
+    message: "Unclassified action. Requires human review or policy update."
+
+# --- LOGGING ---
+logging:
+  path: "${HOME}/.config/agent-gate/logs"
+  format: "jsonl"
+  log_allowed: true
+  log_denied: true
+  log_vault_operations: true

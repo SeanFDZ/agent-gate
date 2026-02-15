@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-gate"
+version = "0.1.0"
+description = "Execution authority layer for AI agents — vault-backed rollback and policy enforcement"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Sean Lavigne"}
+]
+
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+agent-gate = "agent_gate.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/hammer32/agent-gate"
+Issues = "https://github.com/hammer32/agent-gate/issues"
+
+[tool.setuptools.packages.find]
+include = ["agent_gate*"]
