@@ -2,6 +2,13 @@
 
 Integrates Agent Gate as a PreToolUse hook for Claude Code, providing execution authority enforcement when running with `--dangerously-skip-permissions`.
 
+## Architecture
+
+The hooks are thin adapters — they translate Claude Code's hook format to the core `agent_gate` library and map verdicts back to exit codes. All classification, envelope enforcement, and vault logic lives in `agent_gate/` (single source of truth).
+```
+Claude Code tool call → PreToolUse hook → Gate.evaluate() → GateDecision → Exit 0/2
+```
+
 ## What This Does
 
 Agent Gate sits invisibly between Claude Code's tool calls and actual execution. Every Bash command, file Write, and file Edit passes through the gate before it touches the filesystem.
@@ -9,64 +16,101 @@ Agent Gate sits invisibly between Claude Code's tool calls and actual execution.
 - **Read-only operations** (ls, cat, grep) — auto-allowed, no overhead
 - **Destructive operations** (rm, mv, file overwrites) — vault backup before execution
 - **Envelope violations** (paths outside allowed zone) — hard denied
+- **Blocked patterns** (rm -rf /, piped remote execution) — hard denied
 - **Vault access by agent** — hard denied (the agent cannot destroy its own safety net)
 
 Claude Code doesn't know the gate is there. It runs at full speed in dangerous mode while the gate silently enforces the policy underneath.
 
 ## How It Works
 
-Claude Code's [hooks system](https://code.claude.com/docs/en/hooks) fires a `PreToolUse` event before every tool execution. The hook receives the tool name and input as JSON on stdin. Agent Gate reads this, classifies the action, enforces envelope boundaries, triggers vault backup for destructive actions, and returns:
+Claude Code's [hooks system](https://code.claude.com/docs/en/hooks) fires a `PreToolUse` event before every tool execution. The hook receives the tool name and input as JSON on stdin. The hook translates this to the core library's tool call format, calls `Gate.evaluate()`, and returns:
 
 - **Exit 0** — allow the action
-- **Exit 2** — block the action (reason shown to Claude Code)
+- **Exit 2** — block the action (structured denial reason shown to Claude Code)
+
+Denial messages include why the action was blocked and what would be required to proceed (escalation path), using the core library's `GateDecision.to_agent_message()`.
 
 ## Setup
 
-### 1. Create a test environment
+### 1. Clone the repo
 ```bash
-./test_setup.sh ~/agent-gate-test
+git clone https://github.com/SeanFDZ/agent-gate.git ~/projects/agent-gate
 ```
 
-### 2. Update hook paths
+### 2. Configure environment
 
-Edit `agent_gate_hook.py` and `agent_gate_hook_write.py` — set `POLICY_PATH` to your policy file location.
+The hooks use environment variables for configuration:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENT_GATE_POLICY` | `~/projects/agent-gate/policies/default.yaml` | Path to policy YAML |
+| `AGENT_GATE_WORKDIR` | Current working directory | Agent's allowed workspace |
 
 ### 3. Register hooks with Claude Code
 
-Add the hooks to `~/.claude/settings.json` (see `settings_example.json`). Update the `command` paths to point to where you placed the hook scripts.
+Add the hooks to `~/.claude/settings.json` (see `settings_example.json`). Update the `command` paths to match your system. Example:
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{
+          "type": "command",
+          "command": "PYTHONPATH=~/projects/agent-gate python3 ~/projects/agent-gate/integrations/claude_code/agent_gate_hook.py"
+        }]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [{
+          "type": "command",
+          "command": "PYTHONPATH=~/projects/agent-gate python3 ~/projects/agent-gate/integrations/claude_code/agent_gate_hook_write.py"
+        }]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [{
+          "type": "command",
+          "command": "PYTHONPATH=~/projects/agent-gate python3 ~/projects/agent-gate/integrations/claude_code/agent_gate_hook_write.py"
+        }]
+      }
+    ]
+  }
+}
+```
 
 ### 4. Launch Claude Code
 ```bash
-cd ~/agent-gate-test/workspace && claude --dangerously-skip-permissions
+cd ~/your/project && claude --dangerously-skip-permissions
 ```
 
 ## Hooks
 
 | File | Matches | Purpose |
 |------|---------|---------|
-| `agent_gate_hook.py` | Bash | Intercepts shell commands — envelope check, action classification, vault backup |
-| `agent_gate_hook_write.py` | Write, Edit | Intercepts file modifications — envelope check, vault backup before overwrite |
+| `agent_gate_hook.py` | Bash | Splits compound commands, evaluates each via `Gate.evaluate()` |
+| `agent_gate_hook_write.py` | Write, Edit | Resolves file path, evaluates via `Gate.evaluate()` |
+
+Both hooks import and call the `agent_gate` core library. No classification, envelope, or vault logic is duplicated in the hooks.
 
 ## Vault
 
-Every destructive action creates a timestamped snapshot in the vault before execution. Multiple overwrites of the same file create multiple snapshots — full version history.
+Every destructive action creates a snapshot in the vault before execution. Snapshots are organized by path hash with SHA-256 integrity verification and a JSONL manifest.
 ```
 vault/
-├── 20260215_142645/
-│   └── Users/.../workspace/temp_logs/
-│       ├── access.log
-│       └── debug.log
-├── 20260215_143446/
-│   └── Users/.../workspace/family_photos/
-│       ├── kids_birthday.jpg
-│       └── vacation_2024.jpg
-└── 20260215_144423/
-    └── Users/.../workspace/project_notes.md
+├── manifest.jsonl          # Structured audit log of all snapshots
+├── 2d7076113d8c/           # Path hash for file A
+│   ├── 20260216_142645_README.md
+│   └── 20260216_153012_README.md
+└── a8f3bc9e1d04/           # Path hash for file B
+    └── 20260216_143446_config.yaml
 ```
 
-Recovery is a simple copy:
+Recovery uses the CLI:
 ```bash
-cp vault/<timestamp>/path/to/file workspace/path/to/file
+cd ~/projects/agent-gate
+python3 -m agent_gate.cli list
+python3 -m agent_gate.cli restore <vault_path>
 ```
 
 ## Known Limitations
@@ -75,20 +119,16 @@ cp vault/<timestamp>/path/to/file workspace/path/to/file
 
 This is a safety net for well-intentioned agents making mistakes. It is not a security boundary against adversarial agents.
 
-- The Bash command parser is naive — it treats all non-flag arguments as potential paths, which provides accidental protection against some bypass techniques but is fragile
-- Shell expansion (`$()`, backticks, variable substitution) is not evaluated — the gate sees literal strings
-- Interpreter bypass (`python3 -c "os.remove()"`) is blocked by accident (parser misidentifies arguments as paths), not by design
+- **Compound command splitting** is regex-based (`&&`, `||`, `;`, `|`) — nested or quoted delimiters may split incorrectly
+- **Path extraction** treats all non-flag arguments as potential paths, which is naive but conservative
+- **Shell expansion** (`$()`, backticks, variable substitution) is not evaluated — the gate sees literal strings
+- **Interpreter bypass** (`python3 -c "os.remove()"`) is not reliably caught
+- **Policy conditions** (e.g., `target_exists` for write_file) are declared in policy YAML but not yet enforced by the classifier
 - This is application-layer gating, not OS-level sandboxing
 - The gate trusts that Claude Code routes all tool calls through the hook system
 
-## Live Test Results (Feb 15, 2026)
+## Dependencies
 
-Tested with Claude Code in `--dangerously-skip-permissions` mode:
-
-- ✅ Bash `rm` of log files — vault backup, then deletion allowed
-- ✅ Bash `rm -rf` of directory — vault backup of entire directory, then deletion allowed
-- ✅ Write tool overwrite — vault backup of original, then overwrite allowed
-- ✅ Multiple overwrites — each created a separate timestamped snapshot
-- ✅ Envelope violation — operations outside allowed paths blocked
-- ✅ Vault protection — agent cannot access or delete vault contents
-- ✅ Vault recovery — files restored from vault in seconds
+- Python 3.9+
+- PyYAML (`pip install pyyaml`)
+- The `agent_gate` package (from this repo, via PYTHONPATH)

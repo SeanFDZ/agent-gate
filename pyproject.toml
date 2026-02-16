@@ -21,8 +21,8 @@ dependencies = [
 agent-gate = "agent_gate.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/hammer32/agent-gate"
-Issues = "https://github.com/hammer32/agent-gate/issues"
+Homepage = "https://github.com/SeanFDZ/agent-gate"
+Issues = "https://github.com/SeanFDZ/agent-gate/issues"
 
 [tool.setuptools.packages.find]
 include = ["agent_gate*"]

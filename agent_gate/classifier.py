@@ -8,6 +8,7 @@ against structured data.
 """
 
 import shlex
+import os
 from enum import Enum
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -184,14 +185,14 @@ class ActionClassifier:
         # Skip flags (args starting with -)
         for arg in args:
             if not arg.startswith("-"):
-                # Resolve relative paths against workdir
-                p = Path(arg)
+                # Expand ~ and resolve to absolute path
+                expanded = os.path.expanduser(arg)
+                p = Path(expanded)
                 if not p.is_absolute():
-                    # We'll resolve relative to the policy's first allowed path
-                    # In practice, this is the workdir
+                    # Resolve relative paths against workdir
                     base = self.policy.allowed_paths[0].rstrip("/*")
-                    p = Path(base) / arg
-                paths.append(str(p))
+                    p = Path(base) / expanded
+                paths.append(str(p.resolve()))
 
         return paths
 

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/agent_gate_hook.py"
+            "command": "PYTHONPATH=~/projects/agent-gate python3 ~/projects/agent-gate/integrations/claude_code/agent_gate_hook.py"
           }
         ]
       },
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/agent_gate_hook_write.py"
+            "command": "PYTHONPATH=~/projects/agent-gate python3 ~/projects/agent-gate/integrations/claude_code/agent_gate_hook_write.py"
           }
         ]
       },
@@ -24,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /path/to/agent_gate_hook_write.py"
+            "command": "PYTHONPATH=~/projects/agent-gate python3 ~/projects/agent-gate/integrations/claude_code/agent_gate_hook_write.py"
           }
         ]
       }
