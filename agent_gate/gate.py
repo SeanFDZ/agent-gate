@@ -169,6 +169,49 @@ class Gate:
 
         return decision
 
+    def _evaluate_conditions(
+        self, classification: ClassificationResult
+    ) -> bool:
+        """
+        Evaluate conditions declared in a matched policy pattern.
+
+        Conditions are filesystem checks that determine whether a
+        classification actually applies. For example, write_file is
+        only destructive if the target already exists (overwrite).
+        Writing a new file has nothing to destroy.
+
+        Returns True if all conditions are met (or no conditions exist).
+        Returns False if any condition is not satisfied.
+        """
+        pattern = classification.matched_pattern
+        if not pattern or "condition" not in pattern:
+            return True  # No conditions — classification stands
+
+        condition = pattern["condition"]
+
+        if condition == "target_exists":
+            # All target paths must exist for this to be destructive.
+            # For cp src dest, this ensures the destination exists
+            # (i.e., this is an overwrite, not a new copy).
+            if not classification.target_paths:
+                return False
+            return all(Path(path).exists() for path in classification.target_paths)
+
+        elif condition == "target_is_dir":
+            # All target paths must be directories
+            if not classification.target_paths:
+                return False
+            return all(Path(path).is_dir() for path in classification.target_paths)
+
+        # Unknown condition — fail open with a warning log
+        self.logger.warning(json.dumps({
+            "event": "unknown_condition",
+            "condition": condition,
+            "command": classification.command,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }))
+        return True  # Don't block on unknown conditions
+
     def _handle_blocked(
         self, tool_call: dict, classification: ClassificationResult
     ) -> GateDecision:
@@ -212,7 +255,24 @@ class Gate:
         """
         Destructive action — back up targets to vault first,
         then allow if backup succeeds.
+
+        If the matched pattern has a condition (e.g., target_exists)
+        and the condition is not met, the action is reclassified as
+        non-destructive and allowed without vault backup.
         """
+        # Check conditions before committing to vault backup
+        if not self._evaluate_conditions(classification):
+            condition = classification.matched_pattern.get("condition", "")
+            return GateDecision(
+                verdict=Verdict.ALLOW,
+                tool_call=tool_call,
+                classification=classification,
+                reason=(
+                    f"Condition '{condition}' not met. "
+                    f"Action allowed without vault backup."
+                ),
+            )
+
         action_desc = (
             f"{classification.command} {' '.join(classification.args)}"
         )

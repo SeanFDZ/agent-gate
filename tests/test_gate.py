@@ -24,7 +24,7 @@ class TestEnvironment:
     """
 
     def __init__(self):
-        self.base = tempfile.mkdtemp(prefix="agent_gate_test_")
+        self.base = os.path.realpath(tempfile.mkdtemp(prefix="agent_gate_test_"))
         self.workdir = os.path.join(self.base, "workspace")
         self.vault = os.path.join(self.base, "vault")
         self.logs = os.path.join(self.base, "logs")
@@ -69,7 +69,11 @@ actions:
         args_contain: ["-i"]
         description: "In-place edit"
       - command: "write_file"
-        description: "File write/overwrite"
+        condition: "target_exists"
+        description: "Overwrite existing file"
+      - command: "cp"
+        condition: "target_exists"
+        description: "Copy that overwrites existing target"
 
   read_only:
     description: "Auto-allow"
@@ -289,6 +293,69 @@ def run_tests():
     )
 
     print()
+
+    # --- CONDITION EVALUATION TESTS ---
+    print("  Policy Conditions (target_exists)")
+    print("  " + "-" * 40)
+
+    # write_file to a NEW file — condition not met, allow without vault
+    new_file_path = os.path.join(env.workdir, "brand_new_file.txt")
+    test(
+        "write_file new file → ALLOW (no vault, condition not met)",
+        {"tool": "write_file", "input": {
+            "path": new_file_path,
+            "content": "fresh content"
+        }},
+        Verdict.ALLOW,
+        check_fn=lambda d: (
+            d.vault_result is None
+            and "condition" in d.reason.lower()
+        ),
+    )
+
+    # write_file to an EXISTING file — condition met, vault backup happens
+    existing_file = env.create_file("existing.txt", "original content")
+    test(
+        "write_file existing file → ALLOW (with vault backup)",
+        {"tool": "write_file", "input": {
+            "path": existing_file,
+            "content": "overwritten content"
+        }},
+        Verdict.ALLOW,
+        check_fn=lambda d: (
+            d.vault_result is not None
+            and len(d.vault_result.snapshots) > 0
+        ),
+    )
+
+    # cp to a NEW target — condition not met, allow without vault
+    cp_new_target = os.path.join(env.workdir, "copy_dest_new.txt")
+    cp_source = env.create_file("cp_source.txt", "source data")
+    test(
+        "cp to new target → ALLOW (no vault, condition not met)",
+        {"tool": "bash", "input": {
+            "command": f"cp {cp_source} {cp_new_target}"
+        }},
+        Verdict.ALLOW,
+        check_fn=lambda d: (
+            d.vault_result is None
+            and "condition" in d.reason.lower()
+        ),
+    )
+
+    # cp to an EXISTING target — condition met, vault backup happens
+    cp_existing_target = env.create_file("copy_dest_exists.txt", "will be overwritten")
+    test(
+        "cp to existing target → ALLOW (with vault backup)",
+        {"tool": "bash", "input": {
+            "command": f"cp {cp_source} {cp_existing_target}"
+        }},
+        Verdict.ALLOW,
+        check_fn=lambda d: (
+            d.vault_result is not None
+            and len(d.vault_result.snapshots) > 0
+        ),
+    )
 
     # --- UNCLASSIFIED TESTS ---
     print("  Unclassified Actions")
