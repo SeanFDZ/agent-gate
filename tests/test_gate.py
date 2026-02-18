@@ -129,6 +129,13 @@ logging:
             f.write(content)
         return path
 
+    def create_symlink(self, name, target):
+        """Create a symlink in the workspace pointing to target."""
+        link_path = os.path.join(self.workdir, name)
+        os.makedirs(os.path.dirname(link_path), exist_ok=True)
+        os.symlink(target, link_path)
+        return link_path
+
     def cleanup(self):
         shutil.rmtree(self.base, ignore_errors=True)
 
@@ -356,6 +363,68 @@ def run_tests():
             and len(d.vault_result.snapshots) > 0
         ),
     )
+
+    print()
+
+    # --- SYMLINK BYPASS TESTS ---
+    print("  Symlink Envelope Bypass Prevention")
+    print("  " + "-" * 40)
+
+    # Symlink inside workspace pointing to /etc/passwd → DENY
+    etc_link = env.create_symlink("sneaky_etc", "/etc/passwd")
+    test(
+        "cat symlink→/etc/passwd (bash) → DENY",
+        {"tool": "bash", "input": {"command": f"cat {etc_link}"}},
+        Verdict.DENY,
+        check_fn=lambda d: not d.classification.paths_in_envelope,
+    )
+
+    # rm via symlink pointing outside envelope → DENY
+    test(
+        "rm symlink→/etc/passwd (bash) → DENY",
+        {"tool": "bash", "input": {"command": f"rm {etc_link}"}},
+        Verdict.DENY,
+        check_fn=lambda d: not d.classification.paths_in_envelope,
+    )
+
+    # write_file via symlink pointing outside envelope → DENY
+    test(
+        "write_file symlink→/etc/passwd → DENY",
+        {"tool": "write_file", "input": {
+            "path": etc_link,
+            "content": "malicious content"
+        }},
+        Verdict.DENY,
+        check_fn=lambda d: not d.classification.paths_in_envelope,
+    )
+
+    # read_file via symlink pointing outside envelope → DENY
+    test(
+        "read_file symlink→/etc/passwd → DENY",
+        {"tool": "read_file", "input": {"path": etc_link}},
+        Verdict.DENY,
+        check_fn=lambda d: not d.classification.paths_in_envelope,
+    )
+
+    # Symlink inside workspace pointing to vault → DENY
+    vault_link = env.create_symlink("sneaky_vault", env.vault)
+    test(
+        "cat symlink→vault → DENY",
+        {"tool": "bash", "input": {"command": f"cat {vault_link}/manifest.jsonl"}},
+        Verdict.DENY,
+        check_fn=lambda d: not d.classification.paths_in_envelope,
+    )
+
+    # Legitimate symlink within envelope → ALLOW
+    legit_file = env.create_file("real_file.txt", "legitimate content")
+    legit_link = env.create_symlink("legit_link", legit_file)
+    test(
+        "cat symlink→workspace file (legitimate) → ALLOW",
+        {"tool": "bash", "input": {"command": f"cat {legit_link}"}},
+        Verdict.ALLOW,
+    )
+
+    print()
 
     # --- UNCLASSIFIED TESTS ---
     print("  Unclassified Actions")

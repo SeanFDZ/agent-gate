@@ -179,7 +179,9 @@ class ActionClassifier:
 
         # Structured file ops have explicit paths
         if "path" in input_data:
-            paths.append(input_data["path"])
+            raw = os.path.expanduser(input_data["path"])
+            resolved = os.path.realpath(raw)
+            paths.append(resolved)
 
         # For bash commands, extract paths from arguments
         # Skip flags (args starting with -)
@@ -200,13 +202,21 @@ class ActionClassifier:
         """
         Check if all target paths fall within the allowed envelope.
         Returns list of paths that are outside the envelope.
+
+        Resolves symlinks via realpath() before checking — a symlink
+        inside the workspace pointing to /etc/ is caught here even
+        if the string path looks safe.
         """
         outside = []
         for path in paths:
-            if self._path_is_denied(path):
-                outside.append(path)
-            elif not self._path_is_allowed(path):
-                outside.append(path)
+            # Resolve symlinks to get the true filesystem target.
+            # This is the core defense against symlink-based envelope bypass.
+            resolved = os.path.realpath(path)
+
+            if self._path_is_denied(resolved):
+                outside.append(resolved)
+            elif not self._path_is_allowed(resolved):
+                outside.append(resolved)
         return outside
 
     def _path_is_allowed(self, path: str) -> bool:
