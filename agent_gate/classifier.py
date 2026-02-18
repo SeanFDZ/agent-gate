@@ -100,6 +100,25 @@ class ActionClassifier:
             ClassificationResult with tier, extracted paths, and metadata.
         """
         command, args = self._parse_tool_call(tool_call)
+
+        # For bash commands, verify the command is fully literal.
+        # If shell expansion syntax is detected, we can't trust extracted
+        # paths — deny and tell the agent to rewrite with literal values.
+        if tool_call.get("tool") == "bash":
+            raw_command = tool_call.get("input", {}).get("command", "")
+            expansion = self._detect_shell_expansion(command, raw_command)
+            if expansion:
+                return ClassificationResult(
+                    tier=ActionTier.BLOCKED,
+                    command=command,
+                    args=args,
+                    target_paths=[],
+                    reason=(
+                        f"Non-literal command: {expansion}. "
+                        f"Rewrite using literal paths and values."
+                    ),
+                )
+
         target_paths = self._extract_target_paths(command, args, tool_call)
 
         # Check envelope first — any path outside envelope is auto-denied
@@ -178,6 +197,102 @@ class ActionClassifier:
 
         # Structured file operations (write_file, read_file, etc.)
         return tool, []
+
+    def _detect_shell_expansion(
+        self, command: str, raw_command: str
+    ) -> Optional[str]:
+        """
+        Detect shell expansion syntax in a bash command string.
+
+        Agent Gate operates on an allowlist model: known commands with
+        literal arguments. If the shell would transform the command
+        before execution, the gate can't trust the extracted paths
+        or arguments — the literal string doesn't match what runs.
+
+        Instead of trying to enumerate every shell trick, we define
+        what "literal" looks like and reject anything else:
+        - Paths: /absolute/path, ./relative, ~/home-relative
+        - Flags: -f, --force, -rf
+        - Simple values: numbers, plain strings
+        - Single-quoted strings: 'no expansion inside'
+
+        Anything containing shell expansion syntax gets rejected with
+        a message telling the agent to rewrite using literal values.
+
+        Returns None if the command is fully literal.
+        Returns a description of what was detected if expansion found.
+        """
+        import re
+
+        # --- PATTERNS THAT INDICATE NON-LITERAL COMMANDS ---
+
+        # Variable expansion: $VAR, ${VAR}, ${VAR:-default}
+        # But NOT inside single quotes (which suppress expansion)
+        # We check the raw command after stripping single-quoted segments
+        stripped = re.sub(r"'[^']*'", "", raw_command)
+
+        if re.search(r'\$\w', stripped) or re.search(r'\$\{', stripped):
+            return "contains variable expansion ($VAR or ${VAR})"
+
+        # Command substitution: $(command) or `command`
+        if re.search(r'\$\(', stripped) or '`' in stripped:
+            return "contains command substitution ($() or backticks)"
+
+        # Process substitution: <(command) or >(command)
+        if re.search(r'[<>]\(', stripped):
+            return "contains process substitution (<() or >())"
+
+        # Brace expansion: {a,b} or {1..10}
+        # Match braces containing comma or .. (but not ${} which is variable)
+        if re.search(r'(?<!\$)\{[^}]*(,|\.\.)[^}]*\}', stripped):
+            return "contains brace expansion ({a,b} or {1..10})"
+
+        # Unquoted glob in argument position: *, ?, [abc]
+        # We check arguments only (skip the command name itself)
+        # Allow * inside quoted strings (already stripped single quotes above)
+        parts = stripped.split(None, 1)
+        args_portion = parts[1] if len(parts) > 1 else ""
+        # Remove double-quoted segments for glob check
+        args_no_dquotes = re.sub(r'"[^"]*"', '', args_portion)
+        if re.search(r'(?<!\\)[*?]', args_no_dquotes):
+            return "contains unquoted glob pattern (* or ?)"
+        if re.search(r'(?<!\\)\[[^\]]+\]', args_no_dquotes):
+            return "contains glob character class ([...])"
+
+        # eval, exec, source — commands that execute computed strings
+        if command in ('eval', 'exec', 'source', '.'):
+            return f"'{command}' executes computed commands"
+
+        # Interpreter with inline code: python3 -c, perl -e, ruby -e, node -e
+        interpreter_inline = {
+            'python3': ['-c'], 'python': ['-c'],
+            'perl': ['-e', '-E'], 'ruby': ['-e'],
+            'node': ['-e'], 'bash': ['-c'], 'sh': ['-c'], 'zsh': ['-c'],
+        }
+        if command in interpreter_inline:
+            for flag in interpreter_inline[command]:
+                if flag in raw_command.split():
+                    return (
+                        f"'{command} {flag}' executes inline code "
+                        f"that the gate cannot inspect"
+                    )
+
+        # xargs — takes input and builds commands dynamically
+        if command == 'xargs' or ' xargs ' in f' {raw_command} ':
+            return "'xargs' builds commands dynamically from input"
+
+        # Here-string / here-doc redirection used with interpreters
+        # e.g., python3 <<< "os.remove(...)" or python3 << EOF
+        if '<<<' in stripped or '<<' in stripped:
+            # Only flag if combined with an interpreter
+            for interp in interpreter_inline:
+                if interp in raw_command:
+                    return (
+                        f"here-document/here-string with '{interp}' — "
+                        f"gate cannot inspect the piped code"
+                    )
+
+        return None  # Command is literal — safe to proceed
 
     def _extract_target_paths(
         self, command: str, args: List[str], tool_call: dict
