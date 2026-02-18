@@ -15,7 +15,9 @@ Agent Gate sits invisibly between Claude Code's tool calls and actual execution.
 
 - **Read-only operations** (ls, cat, grep) — auto-allowed, no overhead
 - **Destructive operations** (rm, mv, file overwrites) — vault backup before execution
-- **Envelope violations** (paths outside allowed zone) — hard denied
+- **Network operations** (curl, wget, ssh) — escalated for human approval by default
+- **Non-literal commands** (`rm $VAR`, `$(cmd)`, globs) — denied before classification; agent told to rewrite with literal values
+- **Envelope violations** (paths outside allowed zone) — hard denied, symlinks resolved
 - **Blocked patterns** (rm -rf /, piped remote execution) — hard denied
 - **Vault access by agent** — hard denied (the agent cannot destroy its own safety net)
 
@@ -119,11 +121,9 @@ python3 -m agent_gate.cli restore <vault_path>
 
 This is a safety net for well-intentioned agents making mistakes. It is not a security boundary against adversarial agents.
 
+- **Literal-only enforcement** catches shell expansion syntax and interpreter inline code, but programs can compute behavior internally — `python3 script.py` where the script contains `os.remove()` is literal to the gate but computed inside Python
 - **Compound command splitting** is regex-based (`&&`, `||`, `;`, `|`) — nested or quoted delimiters may split incorrectly
 - **Path extraction** treats all non-flag arguments as potential paths, which is naive but conservative
-- **Shell expansion** (`$()`, backticks, variable substitution) is not evaluated — the gate sees literal strings
-- **Interpreter bypass** (`python3 -c "os.remove()"`) is not reliably caught
-- **Policy conditions** (e.g., `target_exists` for write_file) are declared in policy YAML but not yet enforced by the classifier
 - This is application-layer gating, not OS-level sandboxing
 - The gate trusts that Claude Code routes all tool calls through the hook system
 
