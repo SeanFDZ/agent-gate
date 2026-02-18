@@ -20,12 +20,13 @@ from agent_gate.policy_loader import Policy
 
 class ActionTier(Enum):
     """
-    The four possible classifications for any action.
+    The five possible classifications for any action.
     Ordered by severity — check blocked first, then destructive,
-    then read_only, then fall through to unclassified.
+    then network, then read_only, then fall through to unclassified.
     """
     BLOCKED = "blocked"
     DESTRUCTIVE = "destructive"
+    NETWORK = "network"
     READ_ONLY = "read_only"
     UNCLASSIFIED = "unclassified"
 
@@ -62,6 +63,10 @@ class ActionClassifier:
         self._blocked_commands = self._index_patterns(policy.actions["blocked"])
         self._destructive_commands = self._index_patterns(policy.actions["destructive"])
         self._read_only_commands = self._index_patterns(policy.actions["read_only"])
+        # Network tier is optional — graceful handling if not in policy
+        self._network_commands = self._index_patterns(
+            policy.actions.get("network", {})
+        )
 
     def _index_patterns(self, tier_config: dict) -> dict:
         """
@@ -110,7 +115,7 @@ class ActionClassifier:
                 paths_outside_envelope=outside,
             )
 
-        # Check tiers in severity order: blocked → destructive → read_only
+        # Check tiers in severity order: blocked → destructive → network → read_only
         # Blocked check
         result = self._match_tier(
             command, args, self._blocked_commands, ActionTier.BLOCKED
@@ -122,6 +127,14 @@ class ActionClassifier:
         # Destructive check
         result = self._match_tier(
             command, args, self._destructive_commands, ActionTier.DESTRUCTIVE
+        )
+        if result:
+            result.target_paths = target_paths
+            return result
+
+        # Network check
+        result = self._match_tier(
+            command, args, self._network_commands, ActionTier.NETWORK
         )
         if result:
             result.target_paths = target_paths

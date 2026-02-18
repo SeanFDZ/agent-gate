@@ -93,6 +93,26 @@ actions:
       - command: "reboot"
         description: "System reboot"
 
+  network:
+    description: "Network-capable commands. Default escalate — requires human approval."
+    patterns:
+      - command: "curl"
+        description: "HTTP client — can download and exfiltrate data"
+      - command: "wget"
+        description: "HTTP download — can fetch remote payloads"
+      - command: "nc"
+        description: "Netcat — raw network connections"
+      - command: "ssh"
+        description: "Remote shell access"
+      - command: "scp"
+        description: "Remote file copy"
+      - command: "rsync"
+        description: "Remote file sync"
+      - command: "ftp"
+        description: "FTP client"
+      - command: "sftp"
+        description: "Secure FTP client"
+
 # --- GATE BEHAVIOR ---
 gate_behavior:
   on_destructive:
@@ -110,6 +130,10 @@ gate_behavior:
     - "deny_execution"
     - "log_attempt"
     - "return_denial_reason"
+
+  on_network:
+    default: "escalate"
+    message: "Network access requires approval. This command can reach external systems."
 
   on_unclassified:
     default: "deny"

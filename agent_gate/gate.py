@@ -155,6 +155,9 @@ class Gate:
         elif classification.tier == ActionTier.DESTRUCTIVE:
             decision = self._handle_destructive(tool_call, classification)
 
+        elif classification.tier == ActionTier.NETWORK:
+            decision = self._handle_network(tool_call, classification)
+
         elif classification.tier == ActionTier.READ_ONLY:
             decision = self._handle_read_only(tool_call, classification)
 
@@ -334,6 +337,62 @@ class Gate:
                     "proceeding without backup."
                 ),
                 vault_result=vault_result,
+            )
+
+    def _handle_network(
+        self, tool_call: dict, classification: ClassificationResult
+    ) -> GateDecision:
+        """
+        Network-capable action. Default behavior is escalate (require
+        human approval) since network access is legitimate in many
+        workflows but enables two-step bypass patterns like
+        curl-to-disk-then-execute.
+
+        Configurable per-policy via gate_behavior.on_network.default:
+        - "escalate" (default): flag for human review
+        - "deny": hard block all network commands
+        - "allow": permit network access (use with caution)
+        """
+        network_config = self.policy.gate_behavior.get("on_network", {})
+        default_action = network_config.get("default", "escalate")
+        message = network_config.get(
+            "message",
+            "Network access requires approval. "
+            "This command can reach external systems.",
+        )
+
+        if default_action == "allow":
+            return GateDecision(
+                verdict=Verdict.ALLOW,
+                tool_call=tool_call,
+                classification=classification,
+                reason=f"Network action allowed by policy: {classification.reason}",
+            )
+
+        elif default_action == "deny":
+            return GateDecision(
+                verdict=Verdict.DENY,
+                tool_call=tool_call,
+                classification=classification,
+                reason=message,
+                denial_feedback=classification.reason,
+                escalation_hint=(
+                    "Change gate_behavior.on_network.default to 'allow' "
+                    "or 'escalate' in the policy to permit network access."
+                ),
+            )
+
+        else:  # escalate (default)
+            return GateDecision(
+                verdict=Verdict.ESCALATE,
+                tool_call=tool_call,
+                classification=classification,
+                reason=message,
+                escalation_hint=(
+                    "Human approval required for network access. "
+                    "To auto-allow, set gate_behavior.on_network.default "
+                    "to 'allow' in the policy."
+                ),
             )
 
     def _handle_read_only(
