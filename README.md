@@ -70,6 +70,66 @@ The vault lives outside the agent's permitted directory envelope. The same gate 
 | **Blocked** | `rm -rf /`, `curl \| bash`, `mkfs` | Hard deny with feedback |
 | **Unclassified** | Anything not in policy | Default deny, request human review |
 
+## Policy Backends
+
+Agent Gate supports two policy evaluation backends. The gate architecture (vault, routing, condition evaluation, denial feedback) is identical regardless of backend — only the classification engine differs.
+
+### Python Backend (default, zero dependencies)
+
+Policies defined in YAML, evaluated as pure Python pattern matching. No external services required. Works everywhere Python runs.
+
+```python
+gate = Gate(policy_path="policies/default.yaml", workdir="/path/to/project")
+```
+
+Best for: individual developers, Claude Code integration, simple deployments.
+
+### OPA/Rego Backend (enterprise scale)
+
+Policies defined in [Rego](https://www.openpolicyagent.org/docs/latest/policy-language/), evaluated by [Open Policy Agent](https://www.openpolicyagent.org/). Adds policy composition, attribute-based decisions, formal policy testing, and integration with existing governance toolchains (Kubernetes, API gateways, data filtering).
+
+```python
+gate = Gate(
+    policy_path="policies/default.yaml",
+    workdir="/path/to/project",
+    classifier_backend="opa",
+    opa_config={
+        "mode": "subprocess",       # or "http" for OPA sidecar
+        "policy_path": "./rego/",   # directory containing .rego files
+        "package": "agent_gate",    # Rego package name
+    }
+)
+```
+
+Or declare the backend in the policy YAML itself:
+```yaml
+classifier:
+  backend: "opa"
+  opa:
+    mode: "subprocess"
+    policy_path: "./rego/"
+    package: "agent_gate"
+```
+
+Best for: enterprise deployments, teams needing RBAC/policy composition, organizations already using OPA.
+
+**Why OPA?**
+
+- **Policy composition** — base policy + team overlay + project overlay + temporary JIT grants, composed into a single decision
+- **Attribute-based decisions** — who's requesting, what time, what environment, not just what command
+- **Formal policy testing** — unit tests written in Rego, run with `opa test ./rego/ -v`
+- **Enterprise ecosystem** — drops into existing Kubernetes admission control, API authorization, and data filtering toolchains
+
+**OPA quick start:**
+```bash
+# Install OPA
+brew install opa  # macOS
+# or: curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static && chmod +x opa
+
+# Run Rego policy tests (24/24 passing)
+opa test ./rego/ -v
+```
+
 ## Claude Code Integration (Live Tested)
 
 Agent Gate integrates with Claude Code via [PreToolUse hooks](https://code.claude.com/docs/en/hooks), intercepting Bash commands, file Writes, and file Edits before execution. Claude Code runs at full speed with `--dangerously-skip-permissions` while the gate silently enforces the policy underneath.
@@ -134,11 +194,10 @@ Recovery is a copy: `cp vault/<timestamp>/path/to/file workspace/path/to/file`
 
 This is a safety net for well-intentioned agents making mistakes. It is not a security boundary against adversarial agents.
 
-- **Literal-only enforcement** catches shell expansion syntax (`$VAR`, `$(cmd)`, backticks, globs, brace expansion) and interpreter inline code (`python3 -c`, `bash -c`), but programs can compute behavior internally without shell expansion — `python3 script.py` where the script contains `os.remove()` is literal to the gate but computed inside Python. Full coverage requires OS-level sandboxing.
-- **Compound command splitting** is regex-based (`&&`, `||`, `;`, `|`) — nested or quoted delimiters may split incorrectly
-- **Path extraction** treats all non-flag arguments as potential paths — conservative but naive
-- This is application-layer gating, not OS-level sandboxing
-- The gate trusts that Claude Code routes all tool calls through the hook system
+- **Application-layer gating, not OS-level sandboxing.** Agent Gate operates at the tool call level — it inspects what the agent asks to do, not what programs do internally once executed. If your policy allows `python3` (or any interpreter) and the script contains `os.remove()`, the gate sees a literal command and allows it. The default policy classifies unknown commands (including `python3`) as unclassified and denies them — so this is a policy choice, not a gate bypass. Full internal-execution coverage requires OS-level sandboxing (containers, seccomp, AppArmor), which is complementary to Agent Gate, not replaced by it.
+- **Compound command splitting** is regex-based (`&&`, `||`, `;`, `|`). The Claude Code hook splits compound commands and evaluates each sub-command independently — `cd /tmp && rm file` becomes two separate gate evaluations. Edge cases with quoted or nested delimiters may split incorrectly. A stricter alternative is to reject compound commands entirely and require the agent to send discrete tool calls, which the gate can evaluate cleanly. This is a configuration choice we plan to expose as a policy option.
+- **Path extraction** treats all non-flag arguments as potential paths — conservative but naive. This errs on the side of safety (more things are checked against the envelope than necessary) but may produce false positives for commands with non-path arguments.
+- **MCP tools in other frameworks** are not yet covered. Within Claude Code, MCP tools fire through the same PreToolUse hook system (tool names appear as `mcp__<server>__<tool>`) and Agent Gate can intercept them today. For agent frameworks that don't have a hook system (LangChain, CrewAI, custom MCP clients), the gate requires a protocol-level proxy — this is Phase 3 on the roadmap.
 
 ## Quick Start
 ```bash
@@ -147,8 +206,11 @@ cd agent-gate
 pip3 install pyyaml
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
-# Run the test suite
+# Run the test suite (48/48 Python tests)
 python3 -m tests.test_gate
+
+# Run OPA policy tests (24/24 Rego tests, requires opa binary)
+opa test ./rego/ -v
 
 # Use the rollback CLI
 python3 -m agent_gate.cli list
@@ -158,6 +220,8 @@ python3 -m agent_gate.cli diff <vault_path>
 ```
 
 ## Policy Definition
+
+### YAML (Python backend)
 
 Policies are declarative YAML. Define once at design time, enforce at runtime:
 ```yaml
@@ -187,6 +251,33 @@ actions:
 
 See [policies/default.yaml](policies/default.yaml) for the full default policy.
 
+### Rego (OPA backend)
+
+Same semantics expressed in OPA's policy language:
+```rego
+package agent_gate
+
+destructive_patterns := {
+    "rm": {"command": "rm", "description": "File deletion"},
+    "mv": {"command": "mv", "description": "Move/rename"},
+    "write_file": {
+        "command": "write_file",
+        "condition": "target_exists",
+        "description": "Overwrite existing file",
+    },
+}
+
+blocked_patterns := {
+    "rm_rf_root": {
+        "command": "rm",
+        "args_contain": ["-rf /"],
+        "description": "Recursive force delete at root",
+    },
+}
+```
+
+See [rego/agent_gate.rego](rego/agent_gate.rego) for the full Rego policy. Run `opa test ./rego/ -v` to execute the policy unit tests.
+
 ## The Nuclear C2 Analogy
 
 This architecture is inspired by Permissive Action Links (PALs) in nuclear command and control. PALs don't evaluate whether a launch is wise — they verify that correct authority codes are present. Agent Gate follows the same principle:
@@ -198,35 +289,62 @@ This architecture is inspired by Permissive Action Links (PALs) in nuclear comma
 ## Architecture
 ```
 agent_gate/
-├── gate.py           # Gate core — intercept, classify, route, decide
-├── classifier.py     # 5-tier classification, literal-only enforcement, symlink-resolved envelope
-├── vault.py          # Vault manager — backup before destruction
-├── policy_loader.py  # YAML policy parser and validator
-└── cli.py            # Human-facing rollback interface
+├── gate.py              # Gate core — intercept, classify, route, decide
+├── classifier_base.py   # Abstract classifier with shared pre-processing
+├── classifier.py        # Python backend — YAML policies, pure Python eval
+├── opa_classifier.py    # OPA backend — Rego policies via subprocess or HTTP
+├── vault.py             # Vault manager — backup before destruction
+├── policy_loader.py     # YAML policy parser and validator
+└── cli.py               # Human-facing rollback interface
+rego/
+├── agent_gate.rego      # OPA policy (equivalent to default.yaml)
+└── agent_gate_test.rego # Formal policy unit tests (24/24 passing)
 integrations/
-└── claude_code/      # Claude Code PreToolUse hook integration
+└── claude_code/         # Claude Code PreToolUse hook integration
     ├── agent_gate_hook.py       # Bash tool hook
     ├── agent_gate_hook_write.py # Write/Edit tool hook
     ├── settings_example.json    # Hook configuration
     └── test_setup.sh            # Test environment setup
 ```
 
+### Classifier Architecture
+
+The classifier uses a template method pattern with pluggable backends:
+
+```
+Tool Call → ClassifierBase (shared pre-processing)
+              │
+              ├── Parse command + args
+              ├── Shell expansion detection (block non-literal)
+              ├── Path extraction (resolve symlinks)
+              │
+              └── _evaluate() → backend-specific
+                    │
+                    ├── PythonClassifier: YAML patterns, fnmatch envelope
+                    └── OPAClassifier: Rego evaluation via subprocess/HTTP
+```
+
+Pre-processing is structural and backend-independent. Envelope checking and tier matching are policy decisions — this is what the backend implements.
+
 ## Roadmap
 
 - **Phase 1** ✅ — Core gate with simulated tool calls (48/48 tests passing)
 - **Phase 2** ✅ — Claude Code integration via PreToolUse hooks (live tested)
 - **Phase 2.5** ✅ — Hardening: symlink resolution, network tier, literal-only enforcement, policy conditions
-- **Phase 3** — MCP proxy (transparent protocol-level interception)
-- **Phase 4** — OPA/Rego policy engine (sub-millisecond evaluation at scale)
+- **Phase 3** — MCP proxy for non-hook frameworks (transparent protocol-level interception for LangChain, CrewAI, custom MCP clients)
+- **Phase 4** ✅ — OPA/Rego policy engine (dual-backend classifier, 24/24 Rego tests)
 
 ## The Gap This Fills
 
 | Category | Examples | What They Solve | What They Don't |
 |----------|----------|----------------|-----------------|
-| Content guardrails | NeMo, LlamaGuard | What the LLM *says* | What the agent *does* |
+| Content guardrails | NeMo, LlamaGuard, Guardrails AI | What the LLM *says* (hallucinations, PII, toxicity) | What the agent *does* |
+| Agent orchestration platforms | Airia, Astrix ACP | Fleet management, routing, cost optimization, governance dashboards | Pre-execution authority on individual tool calls |
 | Agent sandboxes | nono, cco, Claude sandbox | Directory scoping | Pre-backup on destruction |
-| Checkpoint tools | ccundo, git stash | Rollback | Agent can delete backups |
-| **Agent Gate** | — | **Scoping + vault backup + agent-unreachable recovery** | — |
+| Checkpoint tools | ccundo, git stash | Rollback after the fact | Agent can delete its own backups |
+| **Agent Gate** | — | **Pre-execution authority + vault backup + agent-unreachable recovery + policy-as-code (YAML or OPA/Rego)** | — |
+
+**Why not just use Airia or Guardrails AI?** They solve different problems. Guardrails AI validates what an LLM *outputs* (content safety, PII filtering, hallucination detection) — it assumes the agent is already authorized to act. Airia is an enterprise orchestration platform — it manages which agents run, routes requests between models, and provides governance dashboards. Neither inspects individual tool calls against risk tiers before execution, and neither provides vault-backed rollback that the agent can't reach. Agent Gate is the enforcement layer that sits inside the execution pipeline, not above it.
 
 ## License
 
@@ -235,3 +353,7 @@ Apache 2.0
 ## Author
 
 Sean Lavigne — [GitHub](https://github.com/SeanFDZ)
+
+---
+
+Agent Gate's enforcement pattern maps to NIST SP 800-53 AC-3 (Access Enforcement), AU-9 (Protection of Audit Information), CP-9 (System Backup), and NIST AI RMF MG-2.4 (Contain AI System Impact).

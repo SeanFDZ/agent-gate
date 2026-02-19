@@ -23,7 +23,8 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, List
 
 from agent_gate.policy_loader import Policy, load_policy
-from agent_gate.classifier import ActionClassifier, ActionTier, ClassificationResult
+from agent_gate.classifier_base import ActionTier, ClassificationResult
+from agent_gate.classifier import PythonClassifier, ActionClassifier
 from agent_gate.vault import VaultManager, VaultResult
 
 
@@ -106,7 +107,17 @@ class Gate:
     The Agent Gate.
 
     Usage:
+        # Default (Python classifier, YAML policies):
         gate = Gate(policy_path="policies/default.yaml", workdir="/path/to/project")
+
+        # OPA backend:
+        gate = Gate(
+            policy_path="policies/default.yaml",
+            workdir="/path/to/project",
+            classifier_backend="opa",
+            opa_config={"mode": "subprocess", "policy_path": "./rego/"}
+        )
+
         decision = gate.evaluate(tool_call)
         if decision.allowed:
             execute_tool(tool_call)
@@ -114,9 +125,17 @@ class Gate:
             send_to_agent(decision.to_agent_message())
     """
 
-    def __init__(self, policy_path: str, workdir: str):
+    def __init__(
+        self,
+        policy_path: str,
+        workdir: str,
+        classifier_backend: str = "python",
+        opa_config: Optional[dict] = None,
+    ):
         self.policy = load_policy(policy_path, workdir)
-        self.classifier = ActionClassifier(self.policy)
+        self.classifier = self._create_classifier(
+            classifier_backend, opa_config
+        )
         self.vault = VaultManager(self.policy.vault_config)
         self.logger = self._setup_logger()
 
@@ -125,8 +144,46 @@ class Gate:
             "policy": self.policy.name,
             "workdir": workdir,
             "vault": self.policy.vault_config["path"],
+            "classifier_backend": classifier_backend,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }))
+
+    def _create_classifier(
+        self,
+        backend: str,
+        opa_config: Optional[dict] = None,
+    ):
+        """
+        Instantiate the appropriate classifier backend.
+
+        The classifier is a pluggable component — the gate doesn't
+        care how classification happens, only that it receives a
+        ClassificationResult with tier and metadata.
+
+        Backends:
+          - "python" (default): YAML policies, pure Python evaluation
+          - "opa": Open Policy Agent, Rego policies
+        """
+        # Check if policy itself specifies a backend
+        raw = getattr(self.policy, '_raw', {})
+        policy_backend = raw.get("classifier", {}).get("backend", None)
+        effective_backend = policy_backend or backend
+
+        if effective_backend == "python":
+            return PythonClassifier(self.policy)
+
+        elif effective_backend == "opa":
+            # Lazy import — don't require OPA unless explicitly requested
+            from agent_gate.opa_classifier import OPAClassifier
+            # Merge config sources: explicit > policy > defaults
+            config = opa_config or raw.get("classifier", {}).get("opa", {})
+            return OPAClassifier(self.policy, opa_config=config)
+
+        else:
+            raise ValueError(
+                f"Unknown classifier backend: '{effective_backend}'. "
+                f"Supported: 'python', 'opa'"
+            )
 
     def evaluate(self, tool_call: dict) -> GateDecision:
         """
@@ -193,15 +250,11 @@ class Gate:
         condition = pattern["condition"]
 
         if condition == "target_exists":
-            # All target paths must exist for this to be destructive.
-            # For cp src dest, this ensures the destination exists
-            # (i.e., this is an overwrite, not a new copy).
             if not classification.target_paths:
                 return False
             return all(Path(path).exists() for path in classification.target_paths)
 
         elif condition == "target_is_dir":
-            # All target paths must be directories
             if not classification.target_paths:
                 return False
             return all(Path(path).is_dir() for path in classification.target_paths)
@@ -213,15 +266,12 @@ class Gate:
             "command": classification.command,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }))
-        return True  # Don't block on unknown conditions
+        return True
 
     def _handle_blocked(
         self, tool_call: dict, classification: ClassificationResult
     ) -> GateDecision:
-        """
-        Hard deny. No vault, no escalation for most cases.
-        Just stop.
-        """
+        """Hard deny. No vault, no escalation."""
         # Path outside envelope
         if not classification.paths_in_envelope:
             return GateDecision(
@@ -258,12 +308,8 @@ class Gate:
         """
         Destructive action — back up targets to vault first,
         then allow if backup succeeds.
-
-        If the matched pattern has a condition (e.g., target_exists)
-        and the condition is not met, the action is reclassified as
-        non-destructive and allowed without vault backup.
         """
-        # Check conditions before committing to vault backup
+        # Check conditions before vault backup
         if not self._evaluate_conditions(classification):
             condition = classification.matched_pattern.get("condition", "")
             return GateDecision(
@@ -280,12 +326,10 @@ class Gate:
             f"{classification.command} {' '.join(classification.args)}"
         )
 
-        # Perform vault backup
         vault_result = self.vault.snapshot(
             classification.target_paths, action_desc
         )
 
-        # Check if backup succeeded
         if vault_result.all_backed_up:
             snapshot_count = len(vault_result.snapshots)
             return GateDecision(
@@ -299,7 +343,7 @@ class Gate:
                 vault_result=vault_result,
             )
 
-        # Backup failed — check policy for what to do
+        # Backup failed
         if self.vault.on_failure == "deny":
             return GateDecision(
                 verdict=Verdict.DENY,
@@ -315,7 +359,6 @@ class Gate:
                     "and retry, or change vault.on_failure policy."
                 ),
             )
-
         elif self.vault.on_failure == "escalate":
             return GateDecision(
                 verdict=Verdict.ESCALATE,
@@ -325,9 +368,7 @@ class Gate:
                 vault_result=vault_result,
                 escalation_hint="Human approval required to proceed without backup.",
             )
-
         else:
-            # on_failure: allow (use with extreme caution)
             return GateDecision(
                 verdict=Verdict.ALLOW,
                 tool_call=tool_call,
@@ -343,15 +384,7 @@ class Gate:
         self, tool_call: dict, classification: ClassificationResult
     ) -> GateDecision:
         """
-        Network-capable action. Default behavior is escalate (require
-        human approval) since network access is legitimate in many
-        workflows but enables two-step bypass patterns like
-        curl-to-disk-then-execute.
-
-        Configurable per-policy via gate_behavior.on_network.default:
-        - "escalate" (default): flag for human review
-        - "deny": hard block all network commands
-        - "allow": permit network access (use with caution)
+        Network-capable action. Default: escalate for human approval.
         """
         network_config = self.policy.gate_behavior.get("on_network", {})
         default_action = network_config.get("default", "escalate")
@@ -368,7 +401,6 @@ class Gate:
                 classification=classification,
                 reason=f"Network action allowed by policy: {classification.reason}",
             )
-
         elif default_action == "deny":
             return GateDecision(
                 verdict=Verdict.DENY,
@@ -381,8 +413,7 @@ class Gate:
                     "or 'escalate' in the policy to permit network access."
                 ),
             )
-
-        else:  # escalate (default)
+        else:  # escalate
             return GateDecision(
                 verdict=Verdict.ESCALATE,
                 tool_call=tool_call,
@@ -398,9 +429,7 @@ class Gate:
     def _handle_read_only(
         self, tool_call: dict, classification: ClassificationResult
     ) -> GateDecision:
-        """
-        Read-only action within envelope. Fast path — allow immediately.
-        """
+        """Read-only action within envelope. Fast path — allow immediately."""
         return GateDecision(
             verdict=Verdict.ALLOW,
             tool_call=tool_call,
@@ -411,9 +440,7 @@ class Gate:
     def _handle_unclassified(
         self, tool_call: dict, classification: ClassificationResult
     ) -> GateDecision:
-        """
-        Unknown action. Default deny with explanation.
-        """
+        """Unknown action. Default deny with explanation."""
         default = self.policy.gate_behavior.get("on_unclassified", {})
         default_action = default.get("default", "deny")
         message = default.get(
@@ -467,7 +494,6 @@ class Gate:
         if not log_config:
             return
 
-        # Check if we should log this type
         if decision.verdict == Verdict.ALLOW and not log_config.get("log_allowed", True):
             return
         if decision.verdict == Verdict.DENY and not log_config.get("log_denied", True):
