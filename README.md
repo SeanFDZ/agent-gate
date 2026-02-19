@@ -334,12 +334,13 @@ vault/
 
 Recovery is a copy: `cp vault/<timestamp>/path/to/file workspace/path/to/file`
 
-### Known Limitations — Honest Assessment
+### Known Limitations - Honest Assessment
 
 This is a safety net for well-intentioned agents making mistakes. It is not a security boundary against adversarial agents.
 
 - **Application-layer gating, not OS-level sandboxing.** Agent Gate operates at the tool call level — it inspects what the agent asks to do, not what programs do internally once executed. If your policy allows `python3` (or any interpreter) and the script contains `os.remove()`, the gate sees a literal command and allows it. The default policy classifies unknown commands (including `python3`) as unclassified and denies them — so this is a policy choice, not a gate bypass. Full internal-execution coverage requires OS-level sandboxing (containers, seccomp, AppArmor), which is complementary to Agent Gate, not replaced by it.
 - **Path extraction** treats all non-flag arguments as potential paths — conservative but naive. This errs on the side of safety (more things are checked against the envelope than necessary) but may produce false positives for commands with non-path arguments.
+- **Vault backup is not yet wired for MCP tool calls.** The MCP proxy classifies tool calls and enforces envelope boundaries, but the vault's pre-destruction backup currently operates on bash commands and file write paths. An MCP `delete_file` call will be correctly classified as destructive and denied or escalated by policy — but it won't trigger an automatic vault snapshot the way `rm` does through the Claude Code hook. Extending vault coverage to MCP tool arguments is a Phase 5 item.
 
 ## Quick Start
 ```bash
