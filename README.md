@@ -195,9 +195,7 @@ Recovery is a copy: `cp vault/<timestamp>/path/to/file workspace/path/to/file`
 This is a safety net for well-intentioned agents making mistakes. It is not a security boundary against adversarial agents.
 
 - **Application-layer gating, not OS-level sandboxing.** Agent Gate operates at the tool call level — it inspects what the agent asks to do, not what programs do internally once executed. If your policy allows `python3` (or any interpreter) and the script contains `os.remove()`, the gate sees a literal command and allows it. The default policy classifies unknown commands (including `python3`) as unclassified and denies them — so this is a policy choice, not a gate bypass. Full internal-execution coverage requires OS-level sandboxing (containers, seccomp, AppArmor), which is complementary to Agent Gate, not replaced by it.
-- **Compound command splitting** is regex-based (`&&`, `||`, `;`, `|`). The Claude Code hook splits compound commands and evaluates each sub-command independently — `cd /tmp && rm file` becomes two separate gate evaluations. Edge cases with quoted or nested delimiters may split incorrectly. A stricter alternative is to reject compound commands entirely and require the agent to send discrete tool calls, which the gate can evaluate cleanly. This is a configuration choice we plan to expose as a policy option.
 - **Path extraction** treats all non-flag arguments as potential paths — conservative but naive. This errs on the side of safety (more things are checked against the envelope than necessary) but may produce false positives for commands with non-path arguments.
-- **MCP tools in other frameworks** are not yet covered. Within Claude Code, MCP tools fire through the same PreToolUse hook system (tool names appear as `mcp__<server>__<tool>`) and Agent Gate can intercept them today. For agent frameworks that don't have a hook system (LangChain, CrewAI, custom MCP clients), the gate requires a protocol-level proxy — this is Phase 3 on the roadmap.
 
 ## Quick Start
 ```bash
@@ -331,7 +329,7 @@ Pre-processing is structural and backend-independent. Envelope checking and tier
 - **Phase 1** ✅ — Core gate with simulated tool calls (48/48 tests passing)
 - **Phase 2** ✅ — Claude Code integration via PreToolUse hooks (live tested)
 - **Phase 2.5** ✅ — Hardening: symlink resolution, network tier, literal-only enforcement, policy conditions
-- **Phase 3** — MCP proxy for non-hook frameworks (transparent protocol-level interception for LangChain, CrewAI, custom MCP clients)
+- **Phase 3** — MCP proxy + framework adapters (the interception point between agent intent and tool execution exists in every framework — Claude Code has PreToolUse hooks, MCP has the client-server boundary, LangChain has callbacks. Phase 3 builds the adapters.)
 - **Phase 4** ✅ — OPA/Rego policy engine (dual-backend classifier, 24/24 Rego tests)
 
 ## The Gap This Fills
