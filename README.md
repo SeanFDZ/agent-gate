@@ -8,12 +8,12 @@ The agent runs at full autonomy and full speed. The gate silently ensures every 
 
 ## The Problem
 
-AI agents are gaining the ability to act autonomously — deleting files, modifying configs, writing to databases. The current guardrail ecosystem focuses on what the LLM *says* (content safety). Almost nobody is building the authority layer that controls what the agent *does* before it does it.
+AI agents are gaining the ability to act autonomously â€” deleting files, modifying configs, writing to databases. The current guardrail ecosystem focuses on what the LLM *says* (content safety). Almost nobody is building the authority layer that controls what the agent *does* before it does it.
 
 Existing solutions either:
 
-- **Trust the agent to manage its own safety** — the agent backs up its own files, which means the agent can also delete the backups
-- **Block destructive actions entirely** — which stalls the agent and makes the denial itself the damage
+- **Trust the agent to manage its own safety** â€” the agent backs up its own files, which means the agent can also delete the backups
+- **Block destructive actions entirely** â€” which stalls the agent and makes the denial itself the damage
 
 Agent Gate takes a different approach: **make every action safe to allow.**
 
@@ -21,31 +21,31 @@ Agent Gate takes a different approach: **make every action safe to allow.**
 
 Every AI agent framework follows the same pattern:
 ```
-Agent reasons → Agent outputs structured tool call (JSON) → Client executes
+Agent reasons â†’ Agent outputs structured tool call (JSON) â†’ Client executes
 ```
 
-The model never touches the world directly. That gap between "proposed" and "executed" is the gate insertion point — and it already exists in every framework.
+The model never touches the world directly. That gap between "proposed" and "executed" is the gate insertion point â€” and it already exists in every framework.
 
 ## How It Works
 ```
 Agent proposes: rm important.txt
-         │
-         ▼
-   ┌─────────────┐
-   │  AGENT GATE │
-   ├─────────────┤
-   │ 1. Literal? │  ← reject shell expansion ($VAR, $(cmd), globs)
-   │ 2. Classify │  ← "rm" = destructive action
-   │ 3. Envelope │  ← is resolved path authorized? (follows symlinks)
-   │ 4. Vault    │  ← copy important.txt to vault
-   │ 5. Allow    │  ← backup confirmed, proceed
-   └─────────────┘
-         │
-         ▼
+         â”‚
+         â–¼
+   â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+   â”‚  AGENT GATE â”‚
+   â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¤
+   â”‚ 1. Literal? â”‚  â† reject shell expansion ($VAR, $(cmd), globs)
+   â”‚ 2. Classify â”‚  â† "rm" = destructive action
+   â”‚ 3. Envelope â”‚  â† is resolved path authorized? (follows symlinks)
+   â”‚ 4. Vault    â”‚  â† copy important.txt to vault
+   â”‚ 5. Allow    â”‚  â† backup confirmed, proceed
+   â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+         â”‚
+         â–¼
    rm important.txt executes
 ```
 
-If the command contains shell expansion syntax, it's rejected before classification — the gate can't trust extracted paths when the shell would transform the command. The agent is told to rewrite using literal values.
+If the command contains shell expansion syntax, it's rejected before classification â€” the gate can't trust extracted paths when the shell would transform the command. The agent is told to rewrite using literal values.
 
 If the backup fails, the destructive action is blocked. No snapshot, no destruction.
 
@@ -56,7 +56,7 @@ The vault lives outside the agent's permitted directory envelope. The same gate 
 1. **Prevention over auditability.** Audit trails are necessary but not sufficient. The architecture makes damage reversible, not just logged.
 2. **Pre-computed classification, not runtime evaluation.** Risk tiers and rules are defined at design time. The runtime check is a lookup, not an LLM call.
 3. **Inspect the action, not the reasoning.** We don't need to understand why an agent wants to delete a file. We see "rm" targeting a path and match it against policy.
-4. **Literal-only enforcement.** The gate defines what "clean" looks like — literal paths, flags, and simple values — and rejects anything else. Shell expansion syntax (`$VAR`, `$(cmd)`, globs, backticks) is denied before classification because the gate can't trust paths it can't read. This is an allowlist on arguments, not a blocklist on shell tricks.
+4. **Literal-only enforcement.** The gate defines what "clean" looks like â€” literal paths, flags, and simple values â€” and rejects anything else. Shell expansion syntax (`$VAR`, `$(cmd)`, globs, backticks) is denied before classification because the gate can't trust paths it can't read. This is an allowlist on arguments, not a blocklist on shell tricks.
 5. **Tiered response.** Auto-allow safe actions, vault-backup destructive ones, escalate network access, hard-stop prohibited ones.
 6. **Structured denial feedback.** The gate doesn't just say "no." It returns why and what would be required to proceed.
 
@@ -72,7 +72,7 @@ The vault lives outside the agent's permitted directory envelope. The same gate 
 
 ## Policy Backends
 
-Agent Gate supports two policy evaluation backends. The gate architecture (vault, routing, condition evaluation, denial feedback) is identical regardless of backend — only the classification engine differs.
+Agent Gate supports two policy evaluation backends. The gate architecture (vault, routing, condition evaluation, denial feedback) is identical regardless of backend â€” only the classification engine differs.
 
 ### Python Backend (default, zero dependencies)
 
@@ -115,10 +115,10 @@ Best for: enterprise deployments, teams needing RBAC/policy composition, organiz
 
 **Why OPA?**
 
-- **Policy composition** — base policy + team overlay + project overlay + temporary JIT grants, composed into a single decision
-- **Attribute-based decisions** — who's requesting, what time, what environment, not just what command
-- **Formal policy testing** — unit tests written in Rego, run with `opa test ./rego/ -v`
-- **Enterprise ecosystem** — drops into existing Kubernetes admission control, API authorization, and data filtering toolchains
+- **Policy composition** â€” base policy + team overlay + project overlay + temporary JIT grants, composed into a single decision
+- **Attribute-based decisions** â€” who's requesting, what time, what environment, not just what command
+- **Formal policy testing** â€” unit tests written in Rego, run with `opa test ./rego/ -v`
+- **Enterprise ecosystem** â€” drops into existing Kubernetes admission control, API authorization, and data filtering toolchains
 
 **OPA quick start:**
 ```bash
@@ -134,26 +134,26 @@ opa test ./rego/ -v
 
 Agent Gate integrates with Claude Code via [PreToolUse hooks](https://code.claude.com/docs/en/hooks), intercepting Bash commands, file Writes, and file Edits before execution. Claude Code runs at full speed with `--dangerously-skip-permissions` while the gate silently enforces the policy underneath.
 
-### Live Test Results (48/48 passing — Feb 18, 2026)
+### Live Test Results (48/48 passing â€” Feb 18, 2026)
 
 | Scenario | Result |
 |----------|--------|
-| `rm` log files | ✅ Vault backup, then deletion allowed |
-| `rm -rf` directory of "family photos" | ✅ Entire directory backed up, then deletion allowed |
-| Write tool overwrites file contents | ✅ Original backed up, overwrite allowed |
-| Write tool creates new file | ✅ Allowed without vault backup (nothing to destroy) |
-| Multiple overwrites of same file | ✅ Each created a separate timestamped snapshot |
-| Operation outside allowed paths | ✅ Blocked — envelope violation |
-| Symlink inside workspace → `/etc/` | ✅ Blocked — resolved path outside envelope |
-| Symlink inside workspace → vault | ✅ Blocked — vault is unreachable |
-| Agent tries to access/delete vault | ✅ Blocked — vault is unreachable |
-| Compound commands (`cd /tmp && rm file`) | ✅ Decomposed and each sub-command gated |
-| `rm $TARGET` (variable expansion) | ✅ Blocked — non-literal command |
-| `rm $(cat targets.txt)` (command substitution) | ✅ Blocked — non-literal command |
-| `python3 -c "os.remove(...)"` (inline code) | ✅ Blocked — gate can't inspect inline code |
-| `curl http://example.com` (network) | ✅ Escalated for human approval |
-| `curl ... \| bash` (piped execution) | ✅ Blocked — blocked tier overrides network |
-| Recovery from vault | ✅ Files restored in seconds |
+| `rm` log files | âœ… Vault backup, then deletion allowed |
+| `rm -rf` directory of "family photos" | âœ… Entire directory backed up, then deletion allowed |
+| Write tool overwrites file contents | âœ… Original backed up, overwrite allowed |
+| Write tool creates new file | âœ… Allowed without vault backup (nothing to destroy) |
+| Multiple overwrites of same file | âœ… Each created a separate timestamped snapshot |
+| Operation outside allowed paths | âœ… Blocked â€” envelope violation |
+| Symlink inside workspace â†’ `/etc/` | âœ… Blocked â€” resolved path outside envelope |
+| Symlink inside workspace â†’ vault | âœ… Blocked â€” vault is unreachable |
+| Agent tries to access/delete vault | âœ… Blocked â€” vault is unreachable |
+| Compound commands (`cd /tmp && rm file`) | âœ… Decomposed and each sub-command gated |
+| `rm $TARGET` (variable expansion) | âœ… Blocked â€” non-literal command |
+| `rm $(cat targets.txt)` (command substitution) | âœ… Blocked â€” non-literal command |
+| `python3 -c "os.remove(...)"` (inline code) | âœ… Blocked â€” gate can't inspect inline code |
+| `curl http://example.com` (network) | âœ… Escalated for human approval |
+| `curl ... \| bash` (piped execution) | âœ… Blocked â€” blocked tier overrides network |
+| Recovery from vault | âœ… Files restored in seconds |
 
 ### Setup
 ```bash
@@ -169,33 +169,177 @@ cd ~/agent-gate-test/workspace && claude --dangerously-skip-permissions
 
 See [integrations/claude_code/README.md](integrations/claude_code/README.md) for full setup and configuration.
 
+## MCP Proxy (Protocol-Level Interception)
+
+Agent Gate includes a transparent MCP proxy that sits between any MCP client and server, intercepting `tools/call` requests and routing them through `Gate.evaluate()` before forwarding to the real server. Neither side knows the gate is there.
+
+```
+LLM Client (Claude Desktop, Claude Code, etc.)
+    │
+    │  MCP JSON-RPC (stdio)
+    ▼
+┌──────────────┐
+│  AGENT GATE  │
+│  MCP PROXY   │
+├──────────────┤
+│ Intercept    │ ← receive tools/call from client
+│ Translate    │ ← map MCP params to Gate.evaluate() format
+│ Gate         │ ← classify, envelope, vault, decide
+│ Route        │ ← ALLOW → forward to real server
+│              │   DENY → return JSON-RPC error to client
+│              │   ESCALATE → hold for human approval
+└──────────────┘
+    │
+    │  MCP JSON-RPC (stdio)
+    ▼
+Real MCP Server (filesystem, database, API, etc.)
+```
+
+### Usage
+
+```bash
+# Wrap any MCP server with Agent Gate
+python -m agent_gate.mcp_proxy -- npx @modelcontextprotocol/server-filesystem /path/to/project
+
+# With explicit policy and name
+AGENT_GATE_POLICY=./policies/default.yaml \
+python -m agent_gate.mcp_proxy --name my-fs-server -- npx @modelcontextprotocol/server-filesystem /path
+```
+
+### Claude Desktop Configuration
+
+Replace the server command in `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "python3",
+      "args": [
+        "-m", "agent_gate.mcp_proxy",
+        "--name", "filesystem",
+        "--",
+        "npx", "@modelcontextprotocol/server-filesystem", "/Users/you/projects"
+      ],
+      "env": {
+        "AGENT_GATE_POLICY": "/Users/you/agent-gate/policies/default.yaml",
+        "AGENT_GATE_WORKDIR": "/Users/you/projects",
+        "PYTHONPATH": "/Users/you/agent-gate"
+      }
+    }
+  }
+}
+```
+
+The client sees the same tools, same capabilities, same protocol. The proxy silently enforces the policy underneath.
+
+### What Gets Intercepted
+
+| MCP Message | Proxy Behavior |
+|-------------|----------------|
+| `initialize` | Pass through (handshake) |
+| `tools/list` | Pass through (tool discovery) |
+| `tools/call` | **Intercept → Gate.evaluate() → allow/deny/escalate** |
+| `resources/*` | Pass through |
+| `prompts/*` | Pass through |
+| Everything else | Pass through |
+
+### Denial Response
+
+When the gate denies a tool call, the client receives a standard JSON-RPC error with Agent Gate metadata:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "error": {
+    "code": -32001,
+    "message": "Agent Gate: action denied — Target path(s) outside authorized envelope.",
+    "data": {
+      "gate_verdict": "deny",
+      "tier": "blocked",
+      "reason": "Target path(s) outside authorized envelope."
+    }
+  }
+}
+```
+
+The agent sees the denial reason and can adjust its approach — exactly like a PAL rejection tells the operator what authority is missing.
+
+### Structured Audit Log
+
+Every tool call through the proxy is logged to a JSONL audit file:
+
+```json
+{"timestamp":"2026-02-19T15:30:00Z","tool_name":"read_file","arguments":{"path":"/tmp/test.txt"},"verdict":"allow","tier":"read_only","reason":"Read-only action","duration_ms":0.8,"server_name":"filesystem","session_id":"5ee3c363"}
+```
+
+### Configuration
+
+The proxy uses tiered configuration (env vars > config file > defaults):
+
+```bash
+# Simple: env vars only
+export AGENT_GATE_POLICY=./policies/default.yaml
+export AGENT_GATE_WORKDIR=/path/to/project
+
+# Advanced: config file at ~/.config/agent-gate/proxy.yaml
+```
+
+```yaml
+# ~/.config/agent-gate/proxy.yaml
+policy: ./policies/default.yaml
+workdir: /path/to/project
+classifier_backend: opa
+audit_log: ~/.config/agent-gate/audit.jsonl
+opa:
+  mode: http
+  endpoint: ${AGENT_GATE_OPA_URL}
+  package: agent_gate
+  filter_tools_list: true
+```
+
+### Integration Test Results (12/12 passing — Feb 19, 2026)
+
+Tested against the real `@modelcontextprotocol/server-filesystem`:
+
+| Scenario | Result |
+|----------|--------|
+| MCP initialize handshake | ✅ Passed through, protocol negotiated |
+| tools/list discovery | ✅ All 14 tools visible to client |
+| read_file (read-only) | ✅ Evaluated by gate, forwarded to server |
+| list_directory (unclassified) | ✅ Gate denied (unclassified → deny by policy) |
+| Audit log captures all decisions | ✅ JSONL with timing, tier, verdict |
+| Gate evaluation timing | ✅ Sub-millisecond (avg 0.8ms) |
+| Proxy startup and clean shutdown | ✅ Server subprocess managed |
+
 ### Vault Versioning
 
-Every destructive action creates a timestamped snapshot. Multiple overwrites of the same file create multiple snapshots — full point-in-time recovery:
+Every destructive action creates a timestamped snapshot. Multiple overwrites of the same file create multiple snapshots â€” full point-in-time recovery:
 ```
 vault/
-├── 20260215_142645/         ← first deletion
-│   └── .../temp_logs/
-│       ├── access.log
-│       └── debug.log
-├── 20260215_143446/         ← directory deletion
-│   └── .../family_photos/
-│       ├── kids_birthday.jpg
-│       └── vacation_2024.jpg
-├── 20260215_144423/         ← first overwrite
-│   └── .../project_notes.md
-└── 20260215_144712/         ← second overwrite
-    └── .../project_notes.md (different content)
+â”œâ”€â”€ 20260215_142645/         â† first deletion
+â”‚   â””â”€â”€ .../temp_logs/
+â”‚       â”œâ”€â”€ access.log
+â”‚       â””â”€â”€ debug.log
+â”œâ”€â”€ 20260215_143446/         â† directory deletion
+â”‚   â””â”€â”€ .../family_photos/
+â”‚       â”œâ”€â”€ kids_birthday.jpg
+â”‚       â””â”€â”€ vacation_2024.jpg
+â”œâ”€â”€ 20260215_144423/         â† first overwrite
+â”‚   â””â”€â”€ .../project_notes.md
+â””â”€â”€ 20260215_144712/         â† second overwrite
+    â””â”€â”€ .../project_notes.md (different content)
 ```
 
 Recovery is a copy: `cp vault/<timestamp>/path/to/file workspace/path/to/file`
 
-### Known Limitations — Honest Assessment
+### Known Limitations â€” Honest Assessment
 
 This is a safety net for well-intentioned agents making mistakes. It is not a security boundary against adversarial agents.
 
-- **Application-layer gating, not OS-level sandboxing.** Agent Gate operates at the tool call level — it inspects what the agent asks to do, not what programs do internally once executed. If your policy allows `python3` (or any interpreter) and the script contains `os.remove()`, the gate sees a literal command and allows it. The default policy classifies unknown commands (including `python3`) as unclassified and denies them — so this is a policy choice, not a gate bypass. Full internal-execution coverage requires OS-level sandboxing (containers, seccomp, AppArmor), which is complementary to Agent Gate, not replaced by it.
-- **Path extraction** treats all non-flag arguments as potential paths — conservative but naive. This errs on the side of safety (more things are checked against the envelope than necessary) but may produce false positives for commands with non-path arguments.
+- **Application-layer gating, not OS-level sandboxing.** Agent Gate operates at the tool call level â€” it inspects what the agent asks to do, not what programs do internally once executed. If your policy allows `python3` (or any interpreter) and the script contains `os.remove()`, the gate sees a literal command and allows it. The default policy classifies unknown commands (including `python3`) as unclassified and denies them â€” so this is a policy choice, not a gate bypass. Full internal-execution coverage requires OS-level sandboxing (containers, seccomp, AppArmor), which is complementary to Agent Gate, not replaced by it.
+- **Path extraction** treats all non-flag arguments as potential paths â€” conservative but naive. This errs on the side of safety (more things are checked against the envelope than necessary) but may produce false positives for commands with non-path arguments.
 
 ## Quick Start
 ```bash
@@ -204,11 +348,18 @@ cd agent-gate
 pip3 install pyyaml
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
-# Run the test suite (48/48 Python tests)
-python3 -m tests.test_gate
+# Run all test suites (160/160 Python tests)
+python3 -m tests.test_gate              # Core gate tests (48)
+python3 -m pytest tests/test_mcp_jsonrpc.py   # JSON-RPC parser (52)
+python3 -m pytest tests/test_proxy_config.py  # Config loader (31)
+python3 -m pytest tests/test_audit.py         # Audit logger (11)
+python3 -m pytest tests/test_mcp_proxy.py     # MCP proxy unit (18)
 
 # Run OPA policy tests (24/24 Rego tests, requires opa binary)
 opa test ./rego/ -v
+
+# Run live integration test (12/12, requires npx + @modelcontextprotocol/server-filesystem)
+python3 tests/test_integration_mcp.py
 
 # Use the rollback CLI
 python3 -m agent_gate.cli list
@@ -278,11 +429,11 @@ See [rego/agent_gate.rego](rego/agent_gate.rego) for the full Rego policy. Run `
 
 ## The Nuclear C2 Analogy
 
-This architecture is inspired by Permissive Action Links (PALs) in nuclear command and control. PALs don't evaluate whether a launch is wise — they verify that correct authority codes are present. Agent Gate follows the same principle:
+This architecture is inspired by Permissive Action Links (PALs) in nuclear command and control. PALs don't evaluate whether a launch is wise â€” they verify that correct authority codes are present. Agent Gate follows the same principle:
 
 - **Don't evaluate the agent's reasoning. Verify the action's authorization.**
 - **The gate must not prevent authorized actions.** A gate that's too restrictive is as dangerous as one that's too permissive.
-- **The backup vault is like the safing mechanism.** It doesn't prevent the action — it ensures the action is reversible.
+- **The backup vault is like the safing mechanism.** It doesn't prevent the action â€” it ensures the action is reversible.
 
 ## Architecture
 ```
@@ -293,16 +444,27 @@ agent_gate/
 ├── opa_classifier.py    # OPA backend — Rego policies via subprocess or HTTP
 ├── vault.py             # Vault manager — backup before destruction
 ├── policy_loader.py     # YAML policy parser and validator
-└── cli.py               # Human-facing rollback interface
+├── cli.py               # Human-facing rollback interface
+├── mcp_proxy.py         # MCP proxy — transparent stdio interception layer
+├── mcp_jsonrpc.py       # JSON-RPC 2.0 parser for MCP protocol messages
+├── proxy_config.py      # Proxy configuration loader (env/file/defaults)
+└── audit.py             # Structured JSONL audit logger
 rego/
-├── agent_gate.rego      # OPA policy (equivalent to default.yaml)
-└── agent_gate_test.rego # Formal policy unit tests (24/24 passing)
+â”œâ”€â”€ agent_gate.rego      # OPA policy (equivalent to default.yaml)
+â””â”€â”€ agent_gate_test.rego # Formal policy unit tests (24/24 passing)
 integrations/
-└── claude_code/         # Claude Code PreToolUse hook integration
-    ├── agent_gate_hook.py       # Bash tool hook
-    ├── agent_gate_hook_write.py # Write/Edit tool hook
-    ├── settings_example.json    # Hook configuration
-    └── test_setup.sh            # Test environment setup
+â””â”€â”€ claude_code/         # Claude Code PreToolUse hook integration
+    â”œâ”€â”€ agent_gate_hook.py       # Bash tool hook
+    â”œâ”€â”€ agent_gate_hook_write.py # Write/Edit tool hook
+    â”œâ”€â”€ settings_example.json    # Hook configuration
+    â””â”€â”€ test_setup.sh            # Test environment setup
+tests/
+├── test_gate.py             # Core gate tests (48/48)
+├── test_mcp_jsonrpc.py      # JSON-RPC parser tests (52/52)
+├── test_proxy_config.py     # Config loader tests (31/31)
+├── test_audit.py            # Audit logger tests (11/11)
+├── test_mcp_proxy.py        # MCP proxy unit tests (18/18)
+└── test_integration_mcp.py  # Live integration tests (12/12)
 ```
 
 ### Classifier Architecture
@@ -310,27 +472,27 @@ integrations/
 The classifier uses a template method pattern with pluggable backends:
 
 ```
-Tool Call → ClassifierBase (shared pre-processing)
-              │
-              ├── Parse command + args
-              ├── Shell expansion detection (block non-literal)
-              ├── Path extraction (resolve symlinks)
-              │
-              └── _evaluate() → backend-specific
-                    │
-                    ├── PythonClassifier: YAML patterns, fnmatch envelope
-                    └── OPAClassifier: Rego evaluation via subprocess/HTTP
+Tool Call â†’ ClassifierBase (shared pre-processing)
+              â”‚
+              â”œâ”€â”€ Parse command + args
+              â”œâ”€â”€ Shell expansion detection (block non-literal)
+              â”œâ”€â”€ Path extraction (resolve symlinks)
+              â”‚
+              â””â”€â”€ _evaluate() â†’ backend-specific
+                    â”‚
+                    â”œâ”€â”€ PythonClassifier: YAML patterns, fnmatch envelope
+                    â””â”€â”€ OPAClassifier: Rego evaluation via subprocess/HTTP
 ```
 
-Pre-processing is structural and backend-independent. Envelope checking and tier matching are policy decisions — this is what the backend implements.
+Pre-processing is structural and backend-independent. Envelope checking and tier matching are policy decisions â€” this is what the backend implements.
 
 ## Roadmap
 
-- **Phase 1** ✅ — Core gate with simulated tool calls (48/48 tests passing)
-- **Phase 2** ✅ — Claude Code integration via PreToolUse hooks (live tested)
-- **Phase 2.5** ✅ — Hardening: symlink resolution, network tier, literal-only enforcement, policy conditions
-- **Phase 3** — MCP proxy + framework adapters (the interception point between agent intent and tool execution exists in every framework — Claude Code has PreToolUse hooks, MCP has the client-server boundary, LangChain has callbacks. Phase 3 builds the adapters.)
-- **Phase 4** ✅ — OPA/Rego policy engine (dual-backend classifier, 24/24 Rego tests)
+- **Phase 1** âœ… â€” Core gate with simulated tool calls (48/48 tests passing)
+- **Phase 2** âœ… â€” Claude Code integration via PreToolUse hooks (live tested)
+- **Phase 2.5** âœ… â€” Hardening: symlink resolution, network tier, literal-only enforcement, policy conditions
+- **Phase 3** ✅ — MCP proxy (transparent stdio proxy intercepting `tools/call`, 12/12 integration tests with filesystem MCP server)
+- **Phase 4** âœ… â€” OPA/Rego policy engine (dual-backend classifier, 24/24 Rego tests)
 
 ## The Gap This Fills
 
@@ -340,9 +502,9 @@ Pre-processing is structural and backend-independent. Envelope checking and tier
 | Agent orchestration platforms | Airia, Astrix ACP | Fleet management, routing, cost optimization, governance dashboards | Pre-execution authority on individual tool calls |
 | Agent sandboxes | nono, cco, Claude sandbox | Directory scoping | Pre-backup on destruction |
 | Checkpoint tools | ccundo, git stash | Rollback after the fact | Agent can delete its own backups |
-| **Agent Gate** | — | **Pre-execution authority + vault backup + agent-unreachable recovery + policy-as-code (YAML or OPA/Rego)** | — |
+| **Agent Gate** | â€” | **Pre-execution authority + vault backup + agent-unreachable recovery + policy-as-code (YAML or OPA/Rego)** | â€” |
 
-**Why not just use Airia or Guardrails AI?** They solve different problems. Guardrails AI validates what an LLM *outputs* (content safety, PII filtering, hallucination detection) — it assumes the agent is already authorized to act. Airia is an enterprise orchestration platform — it manages which agents run, routes requests between models, and provides governance dashboards. Neither inspects individual tool calls against risk tiers before execution, and neither provides vault-backed rollback that the agent can't reach. Agent Gate is the enforcement layer that sits inside the execution pipeline, not above it.
+**Why not just use Airia or Guardrails AI?** They solve different problems. Guardrails AI validates what an LLM *outputs* (content safety, PII filtering, hallucination detection) â€” it assumes the agent is already authorized to act. Airia is an enterprise orchestration platform â€” it manages which agents run, routes requests between models, and provides governance dashboards. Neither inspects individual tool calls against risk tiers before execution, and neither provides vault-backed rollback that the agent can't reach. Agent Gate is the enforcement layer that sits inside the execution pipeline, not above it.
 
 ## License
 
@@ -350,7 +512,7 @@ Apache 2.0
 
 ## Author
 
-Sean Lavigne — [GitHub](https://github.com/SeanFDZ)
+Sean Lavigne â€” [GitHub](https://github.com/SeanFDZ)
 
 ---
 

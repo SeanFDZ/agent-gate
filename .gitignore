@@ -7,3 +7,4 @@ build/
 .eggs/
 *.log
 .DS_Store
+*.egg-info/
