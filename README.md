@@ -268,11 +268,13 @@ The agent sees the denial reason and can adjust its approach — exactly like a 
 
 ### Structured Audit Log
 
-Every tool call through the proxy is logged to a JSONL audit file:
+Every tool call through the proxy is logged to a JSONL audit file with SHA-256 hash chaining for tamper evidence. Each record includes a `prev_hash` linking to the prior record and a `record_hash` of its own content, creating a cryptographic chain from a deterministic genesis value. Any modification, insertion, or deletion of a historical record breaks the chain from that point forward.
 
 ```json
-{"timestamp":"2026-02-19T15:30:00Z","tool_name":"read_file","arguments":{"path":"/tmp/test.txt"},"verdict":"allow","tier":"read_only","reason":"Read-only action","duration_ms":0.8,"server_name":"filesystem","session_id":"5ee3c363"}
+{"timestamp":"2026-02-19T15:30:00Z","tool_name":"read_file","arguments":{"path":"/tmp/test.txt"},"verdict":"allow","tier":"read_only","reason":"Read-only action","duration_ms":0.8,"server_name":"filesystem","session_id":"5ee3c363","prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","record_hash":"a1b2c3..."}
 ```
+
+A `verify_chain()` function walks the log and confirms integrity in a single pass — any tampered or deleted record is detected immediately.
 
 ### Configuration
 
@@ -349,11 +351,11 @@ cd agent-gate
 pip3 install pyyaml
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
-# Run all test suites (160/160 Python tests)
+# Run all test suites (170/170 Python tests)
 python3 -m tests.test_gate              # Core gate tests (48)
 python3 -m pytest tests/test_mcp_jsonrpc.py   # JSON-RPC parser (52)
 python3 -m pytest tests/test_proxy_config.py  # Config loader (31)
-python3 -m pytest tests/test_audit.py         # Audit logger (11)
+python3 -m pytest tests/test_audit.py         # Audit logger (21)
 python3 -m pytest tests/test_mcp_proxy.py     # MCP proxy unit (18)
 
 # Run OPA policy tests (24/24 Rego tests, requires opa binary)
@@ -449,7 +451,7 @@ agent_gate/
 ├── mcp_proxy.py         # MCP proxy — transparent stdio interception layer
 ├── mcp_jsonrpc.py       # JSON-RPC 2.0 parser for MCP protocol messages
 ├── proxy_config.py      # Proxy configuration loader (env/file/defaults)
-└── audit.py             # Structured JSONL audit logger
+└── audit.py             # Structured JSONL audit logger with SHA-256 hash chaining
 rego/
 ├── agent_gate.rego      # OPA policy (equivalent to default.yaml)
 └── agent_gate_test.rego # Formal policy unit tests (24/24 passing)
@@ -463,7 +465,7 @@ tests/
 ├── test_gate.py             # Core gate tests (48/48)
 ├── test_mcp_jsonrpc.py      # JSON-RPC parser tests (52/52)
 ├── test_proxy_config.py     # Config loader tests (31/31)
-├── test_audit.py            # Audit logger tests (11/11)
+├── test_audit.py            # Audit logger tests (21/21)
 ├── test_mcp_proxy.py        # MCP proxy unit tests (18/18)
 └── test_integration_mcp.py  # Live integration tests (12/12)
 ```
@@ -517,4 +519,4 @@ Sean Lavigne — [GitHub](https://github.com/SeanFDZ)
 
 ---
 
-Agent Gate's enforcement pattern maps to NIST SP 800-53 AC-3 (Access Enforcement), AU-9 (Protection of Audit Information), CP-9 (System Backup), and NIST AI RMF MG-2.4 (Contain AI System Impact).
+Agent Gate's enforcement pattern maps to NIST SP 800-53 AC-3 (Access Enforcement), AU-9 (Protection of Audit Information), AU-10 (Non-repudiation), CP-9 (System Backup), and NIST AI RMF MG-2.4 (Contain AI System Impact).
