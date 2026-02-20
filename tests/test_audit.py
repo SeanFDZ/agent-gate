@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agent_gate.audit import AuditLogger, AuditRecord
+from agent_gate.audit import verify_chain, GENESIS_HASH
 
 
 class TestAuditRecord(unittest.TestCase):
@@ -156,6 +157,170 @@ class TestAuditLogger(unittest.TestCase):
             self.assertFalse(logger._file.closed)
             logger.close()
             self.assertTrue(logger._file is None or logger._file.closed)
+
+
+class TestHashChain(unittest.TestCase):
+    """Test cryptographic hash chaining for audit log tamper evidence."""
+
+    def test_records_have_hash_fields(self):
+        """Every logged record should have prev_hash and record_hash."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "audit.jsonl")
+            with AuditLogger(path) as logger:
+                logger.log_tool_call("test", {}, "allow", "read_only", "r")
+
+            with open(path) as f:
+                record = json.loads(f.readline())
+            self.assertIn("prev_hash", record)
+            self.assertIn("record_hash", record)
+            self.assertEqual(len(record["record_hash"]), 64)  # SHA-256 hex
+
+    def test_first_record_links_to_genesis(self):
+        """The first record in a new log should have prev_hash = GENESIS_HASH."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "audit.jsonl")
+            with AuditLogger(path) as logger:
+                logger.log_tool_call("test", {}, "allow", "read_only", "r")
+
+            with open(path) as f:
+                record = json.loads(f.readline())
+            self.assertEqual(record["prev_hash"], GENESIS_HASH)
+
+    def test_chain_links_correctly(self):
+        """Each record's prev_hash should match the previous record's record_hash."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "audit.jsonl")
+            with AuditLogger(path) as logger:
+                logger.log_tool_call("tool1", {"a": 1}, "allow", "read_only", "r1")
+                logger.log_tool_call("tool2", {"b": 2}, "deny", "blocked", "r2")
+                logger.log_tool_call("tool3", {"c": 3}, "allow", "read_only", "r3")
+
+            with open(path) as f:
+                records = [json.loads(line) for line in f]
+
+            self.assertEqual(len(records), 3)
+            # First links to genesis
+            self.assertEqual(records[0]["prev_hash"], GENESIS_HASH)
+            # Second links to first
+            self.assertEqual(records[1]["prev_hash"], records[0]["record_hash"])
+            # Third links to second
+            self.assertEqual(records[2]["prev_hash"], records[1]["record_hash"])
+
+    def test_verify_chain_valid(self):
+        """verify_chain should return True for an intact chain."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "audit.jsonl")
+            with AuditLogger(path) as logger:
+                for i in range(5):
+                    logger.log_tool_call(f"tool{i}", {}, "allow", "read_only", "r")
+
+            valid, checked, error = verify_chain(path)
+            self.assertTrue(valid)
+            self.assertEqual(checked, 5)
+            self.assertIsNone(error)
+
+    def test_verify_chain_detects_tampered_record(self):
+        """verify_chain should detect when a record's content is modified."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "audit.jsonl")
+            with AuditLogger(path) as logger:
+                logger.log_tool_call("tool1", {}, "allow", "read_only", "r1")
+                logger.log_tool_call("tool2", {}, "deny", "blocked", "r2")
+                logger.log_tool_call("tool3", {}, "allow", "read_only", "r3")
+
+            # Tamper with the middle record
+            with open(path, "r") as f:
+                lines = f.readlines()
+            record = json.loads(lines[1])
+            record["verdict"] = "allow"  # Change deny -> allow
+            lines[1] = json.dumps(record) + "\n"
+            with open(path, "w") as f:
+                f.writelines(lines)
+
+            valid, checked, error = verify_chain(path)
+            self.assertFalse(valid)
+            self.assertEqual(checked, 1)  # First record OK, second fails
+            self.assertIn("Hash mismatch", error)
+
+    def test_verify_chain_detects_deleted_record(self):
+        """verify_chain should detect when a record is removed from the chain."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "audit.jsonl")
+            with AuditLogger(path) as logger:
+                logger.log_tool_call("tool1", {}, "allow", "read_only", "r1")
+                logger.log_tool_call("tool2", {}, "deny", "blocked", "r2")
+                logger.log_tool_call("tool3", {}, "allow", "read_only", "r3")
+
+            # Delete the middle record
+            with open(path, "r") as f:
+                lines = f.readlines()
+            with open(path, "w") as f:
+                f.write(lines[0])
+                f.write(lines[2])  # Skip middle
+
+            valid, checked, error = verify_chain(path)
+            self.assertFalse(valid)
+            self.assertEqual(checked, 1)  # First OK, third breaks chain
+            self.assertIn("Chain broken", error)
+
+    def test_chain_resumes_after_restart(self):
+        """A new AuditLogger should resume the chain from the last record."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "audit.jsonl")
+
+            # First session
+            with AuditLogger(path) as logger:
+                logger.log_tool_call("tool1", {}, "allow", "read_only", "r1")
+                logger.log_tool_call("tool2", {}, "deny", "blocked", "r2")
+
+            # Second session (new logger instance)
+            with AuditLogger(path) as logger:
+                logger.log_tool_call("tool3", {}, "allow", "read_only", "r3")
+
+            # The chain should be continuous across sessions
+            valid, checked, error = verify_chain(path)
+            self.assertTrue(valid, f"Chain should be valid but got: {error}")
+            self.assertEqual(checked, 3)
+
+    def test_verify_chain_empty_file(self):
+        """verify_chain should handle an empty/missing file gracefully."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "nonexistent.jsonl")
+            valid, checked, error = verify_chain(path)
+            self.assertTrue(valid)
+            self.assertEqual(checked, 0)
+
+    def test_record_hash_is_deterministic(self):
+        """Same content should always produce the same hash."""
+        r1 = AuditRecord(
+            timestamp="2026-02-19T12:00:00Z",
+            tool_name="test", arguments={"x": 1},
+            verdict="allow", tier="read_only", reason="r",
+            prev_hash=GENESIS_HASH,
+        )
+        r2 = AuditRecord(
+            timestamp="2026-02-19T12:00:00Z",
+            tool_name="test", arguments={"x": 1},
+            verdict="allow", tier="read_only", reason="r",
+            prev_hash=GENESIS_HASH,
+        )
+        self.assertEqual(r1.compute_hash(), r2.compute_hash())
+
+    def test_different_content_different_hash(self):
+        """Different content should produce different hashes."""
+        r1 = AuditRecord(
+            timestamp="2026-02-19T12:00:00Z",
+            tool_name="test", arguments={"x": 1},
+            verdict="allow", tier="read_only", reason="r",
+            prev_hash=GENESIS_HASH,
+        )
+        r2 = AuditRecord(
+            timestamp="2026-02-19T12:00:00Z",
+            tool_name="test", arguments={"x": 2},  # Different
+            verdict="allow", tier="read_only", reason="r",
+            prev_hash=GENESIS_HASH,
+        )
+        self.assertNotEqual(r1.compute_hash(), r2.compute_hash())
 
 
 if __name__ == "__main__":
