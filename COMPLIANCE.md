@@ -1,7 +1,7 @@
 # Compliance Framework Mapping — Agent Gate
 
-**Document version:** 0.3.0
-**Agent Gate version:** 0.3.0 (Phase 6: Identity Binding)
+**Document version:** 0.4.0
+**Agent Gate version:** 0.4.0 (Phase 7: MODIFY Decision)
 **Date:** 2026-02-23
 **Status:** Implementation mapping — this is NOT a certification or accreditation claim
 
@@ -46,6 +46,7 @@ SP 800-53 defines the security control catalog used across federal systems. Agen
 | **AU-9(3)** | Cryptographic Protection of Audit Information | SHA-256 hash chaining implemented.  Each audit record includes `prev_hash` (hash of previous record) and `record_hash` (hash of current record content), creating a tamper-evident chain from a deterministic genesis value.  `verify_chain()` walks the log and detects any modification, insertion, or deletion.  Records also include `policy_hash` binding each decision to the governing policy version.  Records are not yet signed with a cryptographic key. | ⚠️ Partial |
 | **AU-10** | Non-repudiation | Hash-chained audit records with policy hash binding AND identity binding (operator, agent_id, service_account, role on every record).  Identity fields included in record hash, providing tamper evidence for identity claims.  Still needs cryptographic signing for full non-repudiation. | ⚠️ Improved |
 | **AU-11** | Audit Record Retention | Vault snapshots have configurable retention (`max_snapshots_per_file`, `max_age_days`). The audit log itself has no automated retention management. | ⚠️ Partial |
+| **AU-12** | Audit Generation | All gate decisions generate audit records automatically.  MODIFY decisions produce combined records capturing both original and modified tool call parameters, the modification rule applied, and the reinvocation verdict.  Records are generated at the enforcement point, not as a separate logging step. | ✅ Implemented |
 
 ### Identification and Authentication (IA)
 
@@ -67,7 +68,7 @@ SP 800-53 defines the security control catalog used across federal systems. Agen
 
 | Control | Title | Agent Gate Mapping | Status |
 |---|---|---|---|
-| **CM-3** | Configuration Change Control | Every audit record includes `policy_hash`, a truncated SHA-256 hash of the governing policy bundle.  This creates a cryptographic binding between each authorization decision and the exact policy version that produced it.  Retroactive policy modifications cannot disguise the original authorization logic — the hash in historical records will not match the modified policy. | ✅ Implemented |
+| **CM-3** | Configuration Change Control | Every audit record includes `policy_hash`, a truncated SHA-256 hash of the governing policy bundle.  This creates a cryptographic binding between each authorization decision and the exact policy version that produced it.  Retroactive policy modifications cannot disguise the original authorization logic — the hash in historical records will not match the modified policy.  MODIFY decisions include a full audit trail of original and modified parameters, proving exactly what change was applied and why. | ✅ Implemented |
 | **CM-7** | Least Functionality | Default-deny for unclassified actions means the agent can only execute commands explicitly classified in the policy.  The policy defines the complete set of allowed functionality. | ✅ Implemented |
 | **CM-7(5)** | Authorized Software — Allowlisting | Literal-only argument enforcement functions as a command allowlist. Shell expansion syntax (`$VAR`, `$(cmd)`, backticks, globs) is rejected before classification — the gate defines what "clean" looks like and rejects anything else. | ✅ Implemented |
 
@@ -84,7 +85,7 @@ SP 800-53 defines the security control catalog used across federal systems. Agen
 | Control | Title | Agent Gate Mapping | Status |
 |---|---|---|---|
 | **SI-4** | System Monitoring | The audit log captures all tool calls with timing, verdicts, and tiers.  Sub-millisecond evaluation timing is recorded for performance monitoring.  The circuit breaker continuously monitors failure rates and slow call rates across a sliding window, automatically transitioning to protective states when thresholds are exceeded — this is automated system monitoring with automated response. | ✅ Implemented |
-| **SI-10** | Information Input Validation | Tool call arguments are validated for literal-only content before classification.  The gate rejects shell expansion, variable references, command substitution, and glob patterns — ensuring the gate evaluates the same paths the shell would execute.  Rate limit context is validated before each action (remaining budget, breaker state, backoff status). | ✅ Implemented |
+| **SI-10** | Information Input Validation | Tool call arguments are validated for literal-only content before classification.  The gate rejects shell expansion, variable references, command substitution, and glob patterns — ensuring the gate evaluates the same paths the shell would execute.  Rate limit context is validated before each action (remaining budget, breaker state, backoff status).  MODIFY operations rewrite non-compliant arguments to safe forms (permission clamping, flag stripping, flag injection, argument appending, depth limiting) rather than simply rejecting them. | ✅ Implemented |
 | **SI-17** | Fail-Safe Procedures | The three-state circuit breaker (CLOSED → OPEN → HALF_OPEN → CLOSED) implements fail-safe behavior.  When failure rates exceed the configured threshold, the system transitions to a known-safe state (read-only mode) rather than continuing to operate in degraded conditions.  HALF_OPEN probing enables automatic recovery without human intervention.  If vault backup fails and policy specifies `on_failure: deny`, destructive actions fail safe to denial. | ✅ Implemented |
 
 ---
@@ -105,7 +106,7 @@ The AI RMF defines four functions: Govern, Map, Measure, and Manage. Agent Gate 
 
 | Subcategory | Description | Agent Gate Mapping | Status |
 |---|---|---|---|
-| **MP-2.3** | Scientific integrity and TEVV considerations are identified and documented | Agent Gate's test suite (220+ passing across eleven test suites) provides evidence of systematic verification.  Known limitations are documented in the README and this compliance mapping. | ⚠️ Supportive |
+| **MP-2.3** | Scientific integrity and TEVV considerations are identified and documented | Agent Gate's test suite (428+ passing across twenty-four test suites) provides evidence of systematic verification.  Known limitations are documented in the README and this compliance mapping. | ⚠️ Supportive |
 
 ### MEASURE
 
@@ -150,7 +151,7 @@ M-24-10 establishes requirements for federal agencies deploying AI. Agent Gate a
 | M-24-10 Requirement | Agent Gate Mapping | Status |
 |---|---|---|
 | **§5(c)(i)(A)** — Complete an AI impact assessment before deployment | Tiered classification and the policy definition process function as a structured impact assessment at the tool call level — defining what the agent can do, what requires backup, and what is prohibited. | ⚠️ Supportive |
-| **§5(c)(i)(B)** — Conduct testing prior to deployment and on a regular basis | 220+ tests across eleven suites, including integration tests against real MCP servers.  OPA backend has formal Rego policy tests including rate limit threshold tests.  Test infrastructure is included in the repository for ongoing testing. | ✅ Implemented |
+| **§5(c)(i)(B)** — Conduct testing prior to deployment and on a regular basis | 428+ tests across twenty-four suites, including integration tests against real MCP servers.  OPA backend has formal Rego policy tests including rate limit threshold tests.  Test infrastructure is included in the repository for ongoing testing. | ✅ Implemented |
 | **§5(c)(i)(D)** — Independently evaluate the AI before deployment | Agent Gate's enforcement is deterministic and fully testable. Policy evaluation can be independently verified by providing a tool call and confirming the expected verdict — no model inference or non-deterministic behavior is involved. | ✅ Implemented |
 | **§5(c)(ii)(A)** — Implement adequate human oversight | Escalation verdict routes actions that exceed the policy envelope to human operators. Network actions default to escalation. Unclassified actions default to denial with instructions for human review. | ✅ Implemented |
 | **§5(c)(ii)(B)** — Halt AI operations in cases of imminent risk | Blocked tier actions are unconditionally denied.  If the vault backup fails and policy specifies `on_failure: deny`, the destructive action is halted.  The circuit breaker automatically halts non-read operations when failure rates exceed configurable thresholds, transitioning the agent to read-only mode.  All halt mechanisms are deterministic — no confidence threshold or model judgment is involved. | ✅ Implemented |
@@ -162,7 +163,7 @@ M-24-10 establishes requirements for federal agencies deploying AI. Agent Gate a
 
 | Framework | Controls Mapped | ✅ Implemented | ⚠️ Partial/Supportive | ❌ Gap |
 |---|---|---|---|---|
-| **SP 800-53** | 31 controls | 23 | 8 | 0 |
+| **SP 800-53** | 32 controls | 24 | 8 | 0 |
 | **AI RMF** | 12 subcategories | 9 | 2 | 1 (n/a) |
 | **ISO 42001** | 6 clauses | 1 | 4 | 1 (n/a) |
 | **OMB M-24-10** | 5 requirements | 4 | 1 | 0 |
@@ -206,6 +207,19 @@ The [AARM Alignment Assessment](AARM_Alignment.md) covers Agent Gate's mapping t
 ---
 
 ## Changelog
+
+### v0.4.0 (2026-02-23) — MODIFY Decision
+
+Phase 7 implementation added MODIFY verdict support:
+
+**New controls mapped:**
+- **AU-12 (Audit Generation)** — Combined audit records for MODIFY decisions capturing original + modified parameters ✅
+
+**Controls upgraded:**
+- **CM-3** — MODIFY audit trail adds change control evidence for parameter rewriting
+- **SI-10** — Argument rewriting via modify operations extends input validation beyond rejection to correction
+
+**Net effect:** SP 800-53 controls mapped: 32 (24 implemented, 8 partial/supportive, 0 gaps).
 
 ### v0.3.0 (2026-02-23) — Identity Binding
 

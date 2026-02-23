@@ -1,7 +1,7 @@
 # AARM Alignment Assessment — Agent Gate
 
-**Document version:** 0.3.0
-**Agent Gate version:** 0.3.0 (Phase 6: Identity Binding)
+**Document version:** 0.4.0
+**Agent Gate version:** 0.4.0 (Phase 7: MODIFY Decision)
 **AARM Specification version:** v0.1
 **Date:** 2026-02-23
 **Status:** Gap analysis — this is NOT a conformance claim
@@ -135,39 +135,41 @@ Agent Gate implements static policy evaluation with two classifier backends (Pyt
 
 ---
 
-#### R4: Five Authorization Decisions ⚠️ Partial
+#### R4: Five Authorization Decisions ⚠️ Improved (4 of 5)
 
 > *Requirement: Implement ALLOW, DENY, MODIFY, STEP_UP, and DEFER.*
 
-Agent Gate implements three of AARM's five authorization decisions:
+Agent Gate implements four of AARM's five authorization decisions:
 
 | AARM Decision | Description | Agent Gate | Status |
 |---|---|---|---|
 | **ALLOW** | Action proceeds | `Verdict.ALLOW` | ✅ Implemented |
 | **DENY** | Action blocked with reason | `Verdict.DENY` | ✅ Implemented with denial feedback and escalation hints |
-| **MODIFY** | Action parameters altered to conform to policy | — | ❌ Not implemented |
+| **MODIFY** | Action parameters altered to conform to policy | `Verdict.MODIFY` | ✅ Implemented with reinvocation loop |
 | **STEP_UP** | Action paused pending human approval | `Verdict.ESCALATE` | ⚠️ Functionally similar — returns error with escalation hint, but no approval workflow to resume |
 | **DEFER** | Action suspended pending additional context | — | ❌ Not implemented |
 
 **Implementation evidence:**
-- `gate.py`: `Verdict` enum defines `ALLOW`, `DENY`, `ESCALATE`
-- `gate.py`: `GateDecision.to_agent_message()` returns structured denial feedback including reason and escalation path
+- `gate.py`: `Verdict` enum defines `ALLOW`, `DENY`, `ESCALATE`, `MODIFY`
+- `gate.py`: `_handle_modify()` builds modified tool call via `modifier.py` and returns `GateDecision` with `modified_tool_call` and `modification_feedback`
+- `modifier.py`: Five idempotent operations — `clamp_permission`, `strip_flags`, `require_flags`, `append_arg`, `max_depth`
+- `mcp_proxy.py`: Reinvocation loop catches `Verdict.MODIFY`, swaps parameters, re-evaluates, depth cap = 1
+- `audit.py`: Combined audit records with `original_tool_call`, `modified_tool_call`, `modification_rule`, `reinvocation_verdict`
+- `gate.py`: `GateDecision.to_agent_message()` returns structured modification feedback including original and modified calls
 - `gate.py`: `_handle_network()` uses `ESCALATE` for network actions, functionally similar to STEP_UP
 - No mechanism exists to hold an action, collect approval, and resume execution
 
-**Gap — MODIFY:** Agent Gate cannot rewrite tool call parameters. For example, AARM envisions modifying a query to add `LIMIT 100` rather than denying it outright. Agent Gate would deny or allow the original action as-is.
+**Gap — DEFER:** Agent Gate has no mechanism to suspend an action and revisit it when additional context becomes available.  Actions are decided synchronously and immediately.
 
-**Gap — DEFER:** Agent Gate has no mechanism to suspend an action and revisit it when additional context becomes available. Actions are decided synchronously and immediately.
-
-**Gap — STEP_UP completion:** While `ESCALATE` signals that human approval is needed, there is no approval service to collect that approval and allow the action to proceed. The current implementation effectively converts STEP_UP to a DENY with an explanation.
+**Gap — STEP_UP completion:** While `ESCALATE` signals that human approval is needed, there is no approval service to collect that approval and allow the action to proceed.  The current implementation effectively converts STEP_UP to a DENY with an explanation.
 
 ---
 
-#### R5: Tamper-Evident Receipts ⚠️ Partial (Improved)
+#### R5: Tamper-Evident Receipts ⚠️ Improved
 
 > *Requirement: Cryptographically signed records binding action, context, decision, and outcome.*
 
-Agent Gate has structured logging with SHA-256 hash chaining for tamper evidence, policy hash binding for configuration traceability, and rate context snapshots on rate-limited decisions.  It does not yet produce fully AARM-conformant signed receipts.
+Agent Gate has structured logging with SHA-256 hash chaining for tamper evidence, policy hash binding for configuration traceability, rate context snapshots on rate-limited decisions, and dual-parameter receipts for MODIFY decisions.  It does not yet produce fully AARM-conformant signed receipts.
 
 | AARM Requirement | Agent Gate Status |
 |---|---|
@@ -175,6 +177,7 @@ Agent Gate has structured logging with SHA-256 hash chaining for tamper evidence
 | Decision recorded | ✅ Verdict and reason logged |
 | Hash-chaining | ✅ SHA-256 `prev_hash` and `record_hash` fields; `verify_chain()` detects tampering |
 | Policy binding | ✅ `policy_hash` (truncated SHA-256) on every record — proves which policy version governed each decision |
+| Dual-parameter binding | ✅ MODIFY records capture both original and modified parameters for forensic review |
 | Context binding | ⚠️ `rate_context` snapshot included on rate-limited decisions; not included on all decisions |
 | Outcome binding | ❌ Action outcome (success/failure of tool execution) not captured |
 | Cryptographic signing | ❌ Records are hash-chained but not signed with a key |
@@ -182,13 +185,16 @@ Agent Gate has structured logging with SHA-256 hash chaining for tamper evidence
 | Vault snapshot integrity | ✅ SHA-256 hashes computed for all vault backups |
 
 **Implementation evidence:**
-- `audit.py`: `AuditRecord` includes `policy_hash`, `rate_context`, `prev_hash`, and `record_hash` fields
+- `audit.py`: `AuditRecord` includes `policy_hash`, `rate_context`, `prev_hash`, `record_hash`, `original_tool_call`, `modified_tool_call`, `modification_rule`, and `reinvocation_verdict` fields
 - `audit.py`: `verify_chain()` walks the log and confirms hash chain integrity in a single pass
 - `policy_loader.py`: `Policy.policy_hash` computes deterministic SHA-256 from sorted JSON of the raw policy
 - `gate.py`: Every logged decision includes `policy_hash`; rate-limited decisions additionally include `rate_context`
+- `mcp_proxy.py`: MODIFY decisions produce combined audit records with both original and modified tool calls
 - `vault.py`: `VaultSnapshot` dataclass includes `sha256` field for each backed-up file
 
-**Remaining gap:** AARM receipts must bind `(action, context, decision, outcome)` as a single signed artifact.  Agent Gate binds action + decision + policy_hash + partial context, but does not capture the outcome of tool execution (did the action succeed after the gate allowed it?), does not include full session context on every record, and does not sign records with a cryptographic key.  The hash chain provides tamper evidence (modification is detectable) but not non-repudiation (cannot prove who created the record).
+Audit records now capture both original and modified parameters for MODIFY decisions.  Hash chain covers all fields including modification data.  Pre-modification parameters are always preserved for forensic review.
+
+**Remaining gap:** AARM receipts must bind `(action, context, decision, outcome)` as a single signed artifact.  Agent Gate binds action + decision + policy_hash + partial context + modification data, but does not capture the outcome of tool execution (did the action succeed after the gate allowed it?), does not include full session context on every record, and does not sign records with a cryptographic key.  The hash chain provides tamper evidence (modification is detectable) but not non-repudiation (cannot prove who created the record).
 
 ---
 
@@ -265,8 +271,8 @@ Agent Gate does not manage credentials. MCP server credentials pass through the 
 | **R1** | MUST | Pre-execution interception | ✅ Satisfied | Core architecture — MCP proxy intercepts all tool calls |
 | **R2** | MUST | Context accumulation | ⚠️ Partial (improved) | Hash-chained audit log; rate tracker accumulates session-level operational context; context feeds back to policy engine via circuit breaker and OPA input; no intent tracking |
 | **R3** | MUST | Policy evaluation with intent alignment | ⚠️ Partial (improved) | Static policy + context-dependent deny via circuit breaker and rate limits; no intent alignment |
-| **R4** | MUST | Five authorization decisions | ⚠️ Partial | ALLOW and DENY implemented; ESCALATE ≈ STEP_UP without completion; no MODIFY or DEFER |
-| **R5** | MUST | Tamper-evident receipts | ⚠️ Partial (improved) | Hash-chained JSONL with policy_hash binding and rate_context snapshots; no cryptographic signing |
+| **R4** | MUST | Five authorization decisions | ⚠️ Improved (4/5) | ALLOW, DENY, MODIFY implemented; ESCALATE ≈ STEP_UP without completion; no DEFER |
+| **R5** | MUST | Tamper-evident receipts | ⚠️ Improved | Hash-chained JSONL with policy_hash binding, rate_context snapshots, and dual-parameter MODIFY receipts; no cryptographic signing |
 | **R6** | MUST | Identity binding | ⚠️ Partial | Environment/config-based identity at 4 of 5 levels; RBAC via role-based policy overrides |
 | **R7** | SHOULD | Semantic distance tracking | ❌ Gap | No embedding or drift detection |
 | **R8** | SHOULD | Telemetry export | ⚠️ Foundation laid | Structured JSONL with OpenTelemetry-ready fields; no SIEM/SOAR transport |
@@ -298,11 +304,11 @@ Agent Gate now implements context-dependent deny through the circuit breaker (op
 - The OPA backend is well-positioned for this: Rego policies can evaluate the `(action, context)` tuple natively once full session context is provided as input alongside rate_context
 - Implement context-dependent allow — actions denied by default that are permitted when context confirms legitimate intent
 
-### 3. MODIFY and DEFER Decisions (R4)
+### 3. DEFER Decision and STEP_UP Completion (R4)
 
-**MODIFY** requires a mechanism to rewrite tool call parameters before forwarding to the server. The MCP proxy already serializes/deserializes JSON-RPC messages — parameter rewriting is a tractable addition.
+**MODIFY** is now implemented (v0.4.0).  Five idempotent operations rewrite tool call parameters.  The MCP proxy owns the reinvocation loop with depth cap = 1.
 
-**DEFER** requires a hold queue and a mechanism to revisit deferred actions when additional context arrives. This is a more significant architectural addition, as the current proxy operates synchronously.
+**DEFER** requires a hold queue and a mechanism to revisit deferred actions when additional context arrives.  This is a more significant architectural addition, as the current proxy operates synchronously.
 
 **STEP_UP completion** requires an approval service — a mechanism (webhook, Slack integration, CLI prompt) to collect human approval and resume a held action.
 
@@ -345,6 +351,15 @@ Agent Gate's vault-backed rollback pattern is not addressed by AARM but represen
 ---
 
 ## Changelog
+
+### v0.4.0 (2026-02-23) — MODIFY Decision
+
+Phase 7 implementation (MODIFY verdict, parameter rewriting, reinvocation loop) advanced two AARM requirements:
+
+- **R4 (Five Authorization Decisions):** Moved from ⚠️ Partial to ⚠️ Improved (4 of 5).  `Verdict.MODIFY` with five idempotent operations (clamp_permission, strip_flags, require_flags, append_arg, max_depth).  MCP proxy reinvocation loop with depth cap = 1.  Combined audit records with original + modified parameters.  OPA backend `modifications` rule support.  Only DEFER remains unimplemented.
+- **R5 (Tamper-Evident Receipts):** Improved.  Audit records now capture both original and modified parameters for MODIFY decisions.  Hash chain covers all fields including modification data.  Pre-modification parameters are always preserved for forensic review.
+
+AARM Core (R1–R6): 0 gaps remaining.  1 fully satisfied, 5 partially satisfied (R4 and R5 improved since v0.3.0).
 
 ### v0.3.0 (2026-02-23) — Identity Binding
 

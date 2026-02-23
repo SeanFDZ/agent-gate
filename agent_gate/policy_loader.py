@@ -128,6 +128,15 @@ class Policy:
                 raise PolicyValidationError(
                     f"actions.{tier}.patterns must contain at least one pattern"
                 )
+            for idx, pattern in enumerate(actions[tier]["patterns"]):
+                self._validate_pattern(tier, idx, pattern)
+
+        # Validate optional tier patterns (e.g., network)
+        for tier_name, tier_cfg in actions.items():
+            if tier_name not in self.REQUIRED_ACTION_TIERS:
+                if isinstance(tier_cfg, dict) and "patterns" in tier_cfg:
+                    for idx, pattern in enumerate(tier_cfg["patterns"]):
+                        self._validate_pattern(tier_name, idx, pattern)
 
         # Verify vault path is in denied_paths (critical safety invariant)
         vault_path = vault["path"]
@@ -393,10 +402,90 @@ class Policy:
                 )
             self._validate_role_overrides(role_name, role_config)
 
+    def _validate_pattern(self, tier_name: str, idx: int, pattern: dict):
+        """Validate a single pattern entry within a tier."""
+        prefix = "actions.{}.patterns[{}]".format(tier_name, idx)
+
+        # Validate args_match (optional, must be compilable regex)
+        if "args_match" in pattern:
+            args_match = pattern["args_match"]
+            if not isinstance(args_match, str):
+                raise PolicyValidationError(
+                    "{}.args_match must be a string".format(prefix)
+                )
+            try:
+                re.compile(args_match)
+            except re.error as e:
+                raise PolicyValidationError(
+                    "{}.args_match is not a valid regex: {}".format(
+                        prefix, e
+                    )
+                )
+
+        # Validate vault (optional, only "skip" in Phase 7)
+        if "vault" in pattern:
+            vault_val = pattern["vault"]
+            valid_vault_values = {"skip"}
+            if vault_val not in valid_vault_values:
+                raise PolicyValidationError(
+                    "{}.vault must be one of {}, got '{}'".format(
+                        prefix, valid_vault_values, vault_val
+                    )
+                )
+
+        # Validate modify (optional, dict of known operations)
+        if "modify" in pattern:
+            modify = pattern["modify"]
+            if not isinstance(modify, dict):
+                raise PolicyValidationError(
+                    "{}.modify must be a mapping".format(prefix)
+                )
+            if not modify:
+                raise PolicyValidationError(
+                    "{}.modify must not be empty".format(prefix)
+                )
+            known_ops = {
+                "clamp_permission", "strip_flags",
+                "require_flags", "append_arg", "max_depth",
+            }
+            for op_name, op_value in modify.items():
+                if op_name not in known_ops:
+                    raise PolicyValidationError(
+                        "{}.modify.{} is not a "
+                        "known operation.  Valid: {}".format(
+                            prefix, op_name, known_ops
+                        )
+                    )
+                # Type checks per operation
+                if op_name == "clamp_permission":
+                    if not isinstance(op_value, str):
+                        raise PolicyValidationError(
+                            "{}.modify.clamp_permission "
+                            "must be a string".format(prefix)
+                        )
+                elif op_name in ("strip_flags", "require_flags"):
+                    if not isinstance(op_value, list):
+                        raise PolicyValidationError(
+                            "{}.modify.{} "
+                            "must be a list".format(prefix, op_name)
+                        )
+                elif op_name == "append_arg":
+                    if not isinstance(op_value, str):
+                        raise PolicyValidationError(
+                            "{}.modify.append_arg "
+                            "must be a string".format(prefix)
+                        )
+                elif op_name == "max_depth":
+                    if not isinstance(op_value, int):
+                        raise PolicyValidationError(
+                            "{}.modify.max_depth "
+                            "must be an integer".format(prefix)
+                        )
+
     def _validate_role_overrides(self, role_name: str, role_config: dict):
         """Validate a single role's override configuration."""
         valid_override_keys = {
-            "rate_limits", "actions", "envelope",
+            "rate_limits", "actions", "envelope", "modify_rules",
         }
         for key in role_config:
             if key not in valid_override_keys:

@@ -36,6 +36,7 @@ class Verdict(Enum):
     ALLOW = "allow"
     DENY = "deny"
     ESCALATE = "escalate"
+    MODIFY = "modify"
 
 
 @dataclass
@@ -59,6 +60,8 @@ class GateDecision:
     denial_feedback: str = ""
     rate_status: Optional[dict] = None
     identity: Optional[dict] = None
+    modified_tool_call: Optional[dict] = None
+    modification_feedback: Optional[dict] = None
 
     def __post_init__(self):
         if not self.timestamp:
@@ -90,6 +93,10 @@ class GateDecision:
             d["rate_status"] = self.rate_status
         if self.identity:
             d["identity"] = self.identity
+        if self.modified_tool_call:
+            d["modified_tool_call"] = self.modified_tool_call
+        if self.modification_feedback:
+            d["modification_feedback"] = self.modification_feedback
         return d
 
     def to_agent_message(self) -> str:
@@ -100,6 +107,21 @@ class GateDecision:
         """
         if self.verdict == Verdict.ALLOW:
             return ""  # No message needed on allow
+
+        if self.verdict == Verdict.MODIFY:
+            lines = ["ACTION MODIFIED:"]
+            if self.modification_feedback:
+                fb = self.modification_feedback
+                lines.append(f"REASON: {fb.get('reason', self.reason)}")
+                if "original_call" in fb:
+                    lines.append(f"ORIGINAL: {fb['original_call']}")
+                if "modified_call" in fb:
+                    lines.append(f"MODIFIED: {fb['modified_call']}")
+                if "policy_rule" in fb:
+                    lines.append(f"POLICY RULE: {fb['policy_rule']}")
+            else:
+                lines.append(f"REASON: {self.reason}")
+            return "\n".join(lines)
 
         lines = [f"ACTION DENIED: {self.reason}"]
 
@@ -292,7 +314,7 @@ class Gate:
                 f"Supported: 'python', 'opa'"
             )
 
-    def evaluate(self, tool_call: dict) -> GateDecision:
+    def evaluate(self, tool_call: dict, reinvocation: bool = False) -> GateDecision:
         """
         Evaluate a single tool call against policy.
 
@@ -379,11 +401,12 @@ class Gate:
         )
 
         # Step 8: Record outcome for circuit breaker.
-        success = decision.verdict == Verdict.ALLOW
+        success = decision.verdict in (Verdict.ALLOW, Verdict.MODIFY)
         self.rate_tracker.record_outcome(tool_name, success, 0)
 
-        # Step 9: Log the decision.
-        self._log_decision(decision)
+        # Step 9: Log the decision (suppressed on reinvocation).
+        if not reinvocation:
+            self._log_decision(decision)
 
         return decision
 
@@ -671,14 +694,87 @@ class Gate:
             ),
         )
 
+    def _handle_modify(
+        self, tool_call: dict, classification: ClassificationResult
+    ) -> GateDecision:
+        """
+        Apply modify operations and return Verdict.MODIFY.
+
+        Called from _handle_destructive() when the matched pattern
+        has a modify block.  Uses modifier.apply_modifications() to
+        rewrite arguments, then builds the modified tool call dict.
+
+        On ModificationError, returns Verdict.DENY (fail closed).
+        """
+        from agent_gate.modifier import apply_modifications, ModificationError
+
+        modify_block = classification.modification_rules
+        try:
+            modified_args, ops_applied = apply_modifications(
+                classification.command,
+                classification.args,
+                modify_block,
+            )
+        except ModificationError as e:
+            return GateDecision(
+                verdict=Verdict.DENY,
+                tool_call=tool_call,
+                classification=classification,
+                reason=f"Modification failed: {e}.  Action denied.",
+                denial_feedback=str(e),
+                escalation_hint=(
+                    "Fix the modify rule in the policy, or "
+                    "submit a corrected command."
+                ),
+            )
+
+        # Build modified tool call dict
+        modified_tool_call = dict(tool_call)
+        modified_input = dict(tool_call.get("input", {}))
+
+        if tool_call.get("tool") == "bash":
+            # Reconstruct the command string
+            modified_cmd = classification.command
+            if modified_args:
+                modified_cmd += " " + " ".join(modified_args)
+            modified_input["command"] = modified_cmd
+        modified_tool_call["input"] = modified_input
+
+        # Build structured feedback
+        description = classification.matched_pattern.get("description", "")
+        rule_id = f"{classification.command}-modify"
+        modification_feedback = {
+            "verdict": "MODIFY",
+            "original_call": {
+                "tool": tool_call.get("tool", ""),
+                "args": f"{classification.command} {' '.join(classification.args)}",
+            },
+            "modified_call": {
+                "tool": modified_tool_call.get("tool", ""),
+                "args": modified_input.get("command", ""),
+            },
+            "reason": f"{description}" if description else "Policy modification applied.",
+            "policy_rule": rule_id,
+            "operations_applied": ops_applied,
+        }
+
+        return GateDecision(
+            verdict=Verdict.MODIFY,
+            tool_call=tool_call,
+            classification=classification,
+            reason=f"Action modified: {description}",
+            modified_tool_call=modified_tool_call,
+            modification_feedback=modification_feedback,
+        )
+
     def _handle_destructive(
         self, tool_call: dict, classification: ClassificationResult
     ) -> GateDecision:
         """
-        Destructive action — back up targets to vault first,
-        then allow if backup succeeds.
+        Destructive action — check for modify rules first, then
+        vault skip, then existing vault backup logic.
         """
-        # Check conditions before vault backup
+        # Check conditions before anything else
         if not self._evaluate_conditions(classification):
             condition = classification.matched_pattern.get("condition", "")
             return GateDecision(
@@ -688,6 +784,26 @@ class Gate:
                 reason=(
                     f"Condition '{condition}' not met. "
                     f"Action allowed without vault backup."
+                ),
+            )
+
+        # Check for modify rules -- delegate to _handle_modify()
+        if classification.modification_rules:
+            return self._handle_modify(tool_call, classification)
+
+        # Check for vault: skip
+        pattern = classification.matched_pattern or {}
+        vault_override = pattern.get("vault")
+
+        if vault_override == "skip":
+            # Audit the action but skip vault backup
+            return GateDecision(
+                verdict=Verdict.ALLOW,
+                tool_call=tool_call,
+                classification=classification,
+                reason=(
+                    f"Destructive action allowed (vault: skip).  "
+                    f"Audit record written, no vault backup."
                 ),
             )
 

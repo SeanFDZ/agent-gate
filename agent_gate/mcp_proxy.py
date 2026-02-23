@@ -320,38 +320,20 @@ class MCPProxy:
 
         duration_ms = (time.time() - start_time) * 1000
 
-        # Audit the decision
+        # Handle MODIFY verdict -- reinvocation loop
+        if decision.verdict == Verdict.MODIFY:
+            return self._handle_modify_verdict(
+                msg, decision, gate_input, tool_name, tool_input,
+                start_time, duration_ms,
+            )
+
+        # Audit the decision (non-MODIFY path, unchanged)
         if self.audit:
-            vault_path = None
-            if hasattr(decision, 'vault_result') and decision.vault_result:
-                vault_path = getattr(decision.vault_result, 'backup_path', None)
-
-            tier_value = (
-                decision.classification.tier.value
-                if decision.classification else "unknown"
-            )
-            rate_ctx = None
-            if tier_value == "rate_limited" and self.gate:
-                rate_ctx = self.gate.rate_tracker.get_rate_context()
-
-            self.audit.log_tool_call(
-                tool_name=tool_name,
-                arguments=tool_input,
-                verdict=decision.verdict.value,
-                tier=tier_value,
-                reason=decision.reason,
-                msg_id=msg.msg_id,
-                vault_path=vault_path,
-                duration_ms=round(duration_ms, 2),
-                policy_hash=self.gate.policy.policy_hash if self.gate else None,
-                rate_context=rate_ctx,
-                operator=self.identity.operator,
-                agent_id=self.identity.agent_id,
-                service_account=self.identity.service_account,
-                role=self.identity.role,
+            self._audit_decision(
+                decision, tool_name, tool_input, msg.msg_id, duration_ms
             )
 
-        # Route based on verdict
+        # Route based on verdict (existing logic, unchanged)
         if decision.verdict == Verdict.ALLOW:
             _log(f"ALLOW: {tool_name} ({round(duration_ms, 1)}ms)")
             return None  # Forward to server
@@ -379,6 +361,204 @@ class MCPProxy:
         return make_error_response(
             msg.msg_id, -32603,
             "Agent Gate: unexpected verdict",
+        )
+
+    def _handle_modify_verdict(
+        self,
+        msg,           # type: MCPMessage
+        decision,      # type: GateDecision
+        original_gate_input,  # type: dict
+        tool_name,     # type: str
+        tool_input,    # type: dict
+        start_time,    # type: float
+        initial_duration_ms,  # type: float
+    ):
+        # type: (...) -> Optional[dict]
+        """
+        Handle a MODIFY verdict: reinvoke the gate with modified call,
+        then route based on the reinvocation result.
+
+        Returns None if the modified call is ALLOWED (forward to server).
+        Returns an error response dict if denied.
+        """
+        modified_tool_call = decision.modified_tool_call
+        if not modified_tool_call:
+            _log(f"MODIFY without modified_tool_call — denying")
+            return make_error_response(
+                msg.msg_id, -32603,
+                "Agent Gate: MODIFY verdict missing modified_tool_call",
+            )
+
+        _log(
+            f"MODIFY: {tool_name} — reinvoking with modified call"
+        )
+
+        # Reinvoke the gate with the modified call
+        try:
+            reinvoke_decision = self.gate.evaluate(
+                modified_tool_call, reinvocation=True
+            )
+        except Exception as e:
+            _log(f"Reinvocation error: {e}")
+            reinvoke_decision = None
+
+        total_duration_ms = (time.time() - start_time) * 1000
+
+        # Determine reinvocation verdict
+        if reinvoke_decision is None:
+            reinvocation_verdict = "error"
+            final_verdict = "deny"
+        elif reinvoke_decision.verdict == Verdict.MODIFY:
+            # Depth cap exceeded -- policy error
+            _log(
+                f"MODIFY on reinvocation (depth cap exceeded) — "
+                f"denying as policy error"
+            )
+            reinvocation_verdict = "modify"
+            final_verdict = "deny"
+        elif reinvoke_decision.verdict == Verdict.ALLOW:
+            reinvocation_verdict = "allow"
+            final_verdict = "modify"  # Original verdict was MODIFY
+        elif reinvoke_decision.verdict == Verdict.DENY:
+            reinvocation_verdict = "deny"
+            final_verdict = "deny"
+        elif reinvoke_decision.verdict == Verdict.ESCALATE:
+            reinvocation_verdict = "escalate"
+            final_verdict = "deny"
+        else:
+            reinvocation_verdict = "unknown"
+            final_verdict = "deny"
+
+        # Assemble combined audit record
+        if self.audit:
+            # Build modification_rule dict
+            feedback = decision.modification_feedback or {}
+            modification_rule = {
+                "rule_id": feedback.get("policy_rule", "unknown"),
+                "description": feedback.get("reason", decision.reason),
+                "operations_applied": feedback.get(
+                    "operations_applied", []
+                ),
+            }
+
+            tier_value = (
+                decision.classification.tier.value
+                if decision.classification else "unknown"
+            )
+
+            self.audit.log_tool_call(
+                tool_name=tool_name,
+                arguments=tool_input,  # Always the original
+                verdict=final_verdict,
+                tier=tier_value,
+                reason=decision.reason,
+                msg_id=msg.msg_id,
+                duration_ms=round(total_duration_ms, 2),
+                policy_hash=(
+                    self.gate.policy.policy_hash
+                    if self.gate else None
+                ),
+                operator=self.identity.operator,
+                agent_id=self.identity.agent_id,
+                service_account=self.identity.service_account,
+                role=self.identity.role,
+                # MODIFY-specific fields
+                original_tool_call=original_gate_input,
+                modified_tool_call=modified_tool_call,
+                modification_rule=modification_rule,
+                reinvocation_verdict=reinvocation_verdict,
+            )
+
+        # Route based on reinvocation result
+        if reinvocation_verdict == "allow":
+            _log(
+                f"MODIFY+ALLOW: {tool_name} "
+                f"({round(total_duration_ms, 1)}ms)"
+            )
+            # Swap the message content to use modified tool call
+            # The MCP message forwarded to the server uses modified params
+            msg.raw = self._rebuild_tool_call_message(
+                msg.raw, modified_tool_call
+            )
+            return None  # Forward modified call to server
+
+        else:
+            reason = (
+                f"Action modified but reinvocation returned "
+                f"{reinvocation_verdict}."
+            )
+            _log(f"MODIFY+DENY: {tool_name} — {reason}")
+            tier = (
+                decision.classification.tier.value
+                if decision.classification else "unknown"
+            )
+            return make_gate_denial(
+                msg_id=msg.msg_id,
+                reason=reason,
+                tier=tier,
+            )
+
+    def _rebuild_tool_call_message(
+        self, original_raw, modified_tool_call
+    ):
+        # type: (dict, dict) -> dict
+        """
+        Rebuild the raw MCP message with modified tool call parameters.
+
+        The proxy forwards the modified call to the server, so the
+        message body must reflect the modified arguments.
+        """
+        rebuilt = dict(original_raw)
+        params = dict(rebuilt.get("params", {}))
+        modified_input = modified_tool_call.get("input", {})
+        if "arguments" in params:
+            params["arguments"] = modified_input
+        elif "input" in params:
+            params["input"] = modified_input
+        rebuilt["params"] = params
+        return rebuilt
+
+    def _audit_decision(
+        self,
+        decision,    # type: GateDecision
+        tool_name,   # type: str
+        tool_input,  # type: dict
+        msg_id,
+        duration_ms,  # type: float
+    ):
+        # type: (...) -> None
+        """Audit a non-MODIFY decision (extracted for readability)."""
+        vault_path = None
+        if hasattr(decision, 'vault_result') and decision.vault_result:
+            vault_path = getattr(
+                decision.vault_result, 'backup_path', None
+            )
+
+        tier_value = (
+            decision.classification.tier.value
+            if decision.classification else "unknown"
+        )
+        rate_ctx = None
+        if tier_value == "rate_limited" and self.gate:
+            rate_ctx = self.gate.rate_tracker.get_rate_context()
+
+        self.audit.log_tool_call(
+            tool_name=tool_name,
+            arguments=tool_input,
+            verdict=decision.verdict.value,
+            tier=tier_value,
+            reason=decision.reason,
+            msg_id=msg_id,
+            vault_path=vault_path,
+            duration_ms=round(duration_ms, 2),
+            policy_hash=(
+                self.gate.policy.policy_hash if self.gate else None
+            ),
+            rate_context=rate_ctx,
+            operator=self.identity.operator,
+            agent_id=self.identity.agent_id,
+            service_account=self.identity.service_account,
+            role=self.identity.role,
         )
 
     def _handle_tool_list_response(self, msg: MCPMessage) -> Optional[dict]:

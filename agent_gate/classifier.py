@@ -177,6 +177,7 @@ class PythonClassifier(ClassifierBase):
             return None
 
         for pattern in tier_index[command]:
+            # Check args_contain (existing behavior)
             if "args_contain" in pattern:
                 args_str = " ".join(args)
                 full_str = f"{command} {args_str}"
@@ -187,9 +188,24 @@ class PythonClassifier(ClassifierBase):
                 if not matched:
                     continue
 
+            # Check args_match (new: regex on full argument string)
+            if "args_match" in pattern:
+                args_str = " ".join(args)
+                full_str = f"{command} {args_str}"
+                try:
+                    if not re.search(pattern["args_match"], full_str):
+                        continue
+                except re.error:
+                    # Invalid regex should have been caught by policy loader,
+                    # but fail safely if it wasn't.
+                    continue
+
             reason = pattern.get(
                 "description", f"Matched {tier.value} pattern"
             )
+
+            # Extract modification_rules if present
+            modification_rules = pattern.get("modify")
 
             return ClassificationResult(
                 tier=tier,
@@ -198,6 +214,7 @@ class PythonClassifier(ClassifierBase):
                 target_paths=[],  # filled by caller
                 matched_pattern=pattern,
                 reason=reason,
+                modification_rules=modification_rules,
             )
 
         return None

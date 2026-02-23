@@ -194,6 +194,10 @@ class OPAClassifier(ClassifierBase):
 
         Good for development and CI — no running server needed.
         Slower than HTTP mode but zero infrastructure.
+
+        Queries both the decision and modifications rules.  The combined
+        result allows the gate to detect MODIFY verdicts when non-empty
+        modifications are returned alongside a denied decision.
         """
         input_json = json.dumps({"input": input_doc})
         rego_dir = Path(self.rego_path)
@@ -206,9 +210,13 @@ class OPAClassifier(ClassifierBase):
         if not rego_files:
             raise OPAError(f"No .rego files found in {rego_dir}")
 
-        # Build the opa eval command
-        # Query the main decision document
-        query = f"data.{self.package}.decision"
+        # Query both decision and modifications
+        query = (
+            "x := {{"
+            '"decision": data.{pkg}.decision, '
+            '"modifications": data.{pkg}.modifications'
+            "}}".format(pkg=self.package)
+        )
 
         cmd = [
             "opa", "eval",
@@ -243,7 +251,12 @@ class OPAClassifier(ClassifierBase):
             expressions = output.get("result", [{}])[0].get("expressions", [])
             if not expressions:
                 raise OPAError("OPA returned no expressions")
-            return expressions[0].get("value", {})
+            value = expressions[0].get("value", {})
+            # Return combined result with decision and modifications
+            if "decision" in value and "modifications" in value:
+                return value
+            # Fallback: treat the whole value as the decision (legacy)
+            return value
         except (IndexError, KeyError) as e:
             raise OPAError(f"Unexpected OPA response format: {e}")
 
@@ -252,13 +265,17 @@ class OPAClassifier(ClassifierBase):
         Evaluate via OPA's REST API.
 
         Production mode — requires a running OPA server (typically
-        as a sidecar or centralized service). Faster than subprocess,
+        as a sidecar or centralized service).  Faster than subprocess,
         supports bundling, decision logs, and status API.
+
+        Queries the full package to get both decision and modifications.
         """
         import urllib.request
         import urllib.error
 
-        url = f"{self.opa_url}/v1/data/{self.package.replace('.', '/')}/decision"
+        url = "{}/v1/data/{}".format(
+            self.opa_url, self.package.replace(".", "/")
+        )
         payload = json.dumps({"input": input_doc}).encode("utf-8")
 
         req = urllib.request.Request(
@@ -271,9 +288,20 @@ class OPAClassifier(ClassifierBase):
         try:
             with urllib.request.urlopen(req, timeout=5) as response:
                 body = json.loads(response.read().decode("utf-8"))
-                return body.get("result", {})
+                result = body.get("result", {})
+                # Return combined result if both decision and modifications present
+                if "decision" in result and "modifications" in result:
+                    return result
+                # Legacy: result is the decision itself
+                if "decision" in result:
+                    return {"decision": result["decision"], "modifications": []}
+                return result
         except urllib.error.URLError as e:
-            raise OPAError(f"Failed to reach OPA server at {self.opa_url}: {e}")
+            raise OPAError(
+                "Failed to reach OPA server at {}: {}".format(
+                    self.opa_url, e
+                )
+            )
         except json.JSONDecodeError:
             raise OPAError("OPA server returned invalid JSON")
 
@@ -287,27 +315,44 @@ class OPAClassifier(ClassifierBase):
         """
         Map OPA's decision document back to a ClassificationResult.
 
-        Expected OPA result format:
-        {
-            "tier": "destructive",
-            "reason": "File deletion",
-            "paths_in_envelope": true,
-            "paths_outside_envelope": [],
-            "matched_pattern": {"command": "rm", "description": "..."}
-        }
+        Handles two formats:
+        1. Combined format (new): {"decision": {...}, "modifications": [...]}
+        2. Legacy format: {"tier": ..., "reason": ..., ...}
+
+        When non-empty modifications are present, the first match's modify
+        block is extracted into modification_rules on the result.
         """
-        tier_str = opa_result.get("tier", "unclassified")
+        # Detect combined vs legacy format
+        if "decision" in opa_result and "modifications" in opa_result:
+            decision = opa_result["decision"]
+            modifications = opa_result.get("modifications", [])
+        else:
+            decision = opa_result
+            modifications = []
+
+        tier_str = decision.get("tier", "unclassified")
         tier = self.TIER_MAP.get(tier_str, ActionTier.UNCLASSIFIED)
 
-        paths_in_envelope = opa_result.get("paths_in_envelope", True)
-        paths_outside = opa_result.get("paths_outside_envelope", [])
-        reason = opa_result.get("reason", f"OPA classified as {tier_str}")
-        matched_pattern = opa_result.get("matched_pattern")
+        paths_in_envelope = decision.get("paths_in_envelope", True)
+        paths_outside = decision.get("paths_outside_envelope", [])
+        reason = decision.get("reason", "OPA classified as {}".format(tier_str))
+        matched_pattern = decision.get("matched_pattern")
 
         # If OPA reports envelope violation, override tier to BLOCKED
         if not paths_in_envelope:
             tier = ActionTier.BLOCKED
-            reason = f"Path(s) outside envelope: {', '.join(paths_outside)}"
+            reason = "Path(s) outside envelope: {}".format(
+                ", ".join(paths_outside)
+            )
+
+        # Check for modifications (first match wins)
+        modification_rules = None
+        if modifications and isinstance(modifications, (list, set)):
+            mod_list = list(modifications)
+            if mod_list:
+                first_mod = mod_list[0]
+                if isinstance(first_mod, dict):
+                    modification_rules = first_mod.get("modify")
 
         return ClassificationResult(
             tier=tier,
@@ -318,4 +363,5 @@ class OPAClassifier(ClassifierBase):
             reason=reason,
             paths_in_envelope=paths_in_envelope,
             paths_outside_envelope=paths_outside,
+            modification_rules=modification_rules,
         )

@@ -64,6 +64,7 @@ class ClassificationResult:
     reason: str = ""
     paths_in_envelope: bool = True
     paths_outside_envelope: List[str] = field(default_factory=list)
+    modification_rules: Optional[dict] = None  # Phase 7: modify block from matched pattern
 
 
 class ClassifierBase(ABC):

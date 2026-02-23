@@ -1,6 +1,6 @@
 # Agent Gate — Development Roadmap
 
-**Version:** 0.3.0 → 0.5.0
+**Version:** 0.4.0 → 0.6.0
 **Date:** 2026-02-23
 **Status:** Active development plan
 
@@ -8,7 +8,7 @@
 
 ## Strategic Context
 
-Agent Gate v0.3.0 delivers execution authority with vault-backed rollback, rate limiting, circuit breaker, identity binding with RBAC, dual-backend policy (Python/OPA), MCP proxy, and structured audit with hash chaining, policy hash traceability, and identity binding.  310+ tests across seventeen suites.
+Agent Gate v0.4.0 delivers execution authority with vault-backed rollback, rate limiting, circuit breaker, identity binding with RBAC, MODIFY parameter rewriting, dual-backend policy (Python/OPA), MCP proxy with reinvocation loop, and structured audit with hash chaining, policy hash traceability, identity binding, and modification records.  428+ tests across twenty-four suites.
 
 The roadmap ahead is shaped by three converging priorities:
 
@@ -53,66 +53,24 @@ The roadmap ahead is shaped by three converging priorities:
 
 ---
 
-## Phase 7: MODIFY Decision (v0.3.0 or v0.4.0)
+## Phase 7: MODIFY Decision (v0.4.0) ✅
 
-**Target:** March–April 2026
-**AARM:** R4 (Five Authorization Decisions) — currently ⚠️ Partial
+**Target:** March 2026 — ✅ Released 2026-02-23
+**AARM:** R4 (Five Authorization Decisions) — ⚠️ Partial → ⚠️ Improved
 **Strategic:** Differentiator against sandbox tools that can only block.
 
-### The Problem
+### What Was Delivered
 
-Agent Gate currently makes binary decisions: allow or deny.  ESCALATE exists but effectively converts to deny without an approval service.  There is no mechanism to rewrite a tool call to make it safe rather than blocking it outright.
+Added the MODIFY verdict — the gate can rewrite tool call parameters to make them policy-compliant rather than blocking outright.
 
-Examples of where MODIFY adds value:
-
-- Agent tries `SELECT * FROM users` → gate rewrites to `SELECT * FROM users LIMIT 100`
-- Agent tries `rm -rf /workspace/data/` → gate rewrites to `rm -rf /workspace/data/tmp/` (scope reduction)
-- Agent tries `curl http://api.example.com` → gate rewrites to add `--max-time 30` (timeout enforcement)
-- Agent tries `chmod 777 deploy.sh` → gate rewrites to `chmod 755 deploy.sh` (permission clamping)
-
-### Deliverables
-
-**New verdict:**
-
-```python
-class Verdict(Enum):
-    ALLOW = "allow"
-    DENY = "deny"
-    ESCALATE = "escalate"
-    MODIFY = "modify"       # NEW
-```
-
-**Policy schema extension:**
-
-```yaml
-actions:
-  destructive:
-    patterns:
-      - command: "rm"
-        args_contain: ["-rf"]
-        modify:
-          # Rewrite rules applied before forwarding
-          strip_args: ["-f"]              # Remove force flag
-          max_depth: 2                    # Limit recursive depth
-          require_args: ["--interactive"] # Add safety flag
-      - command: "chmod"
-        modify:
-          clamp_permissions: "755"        # Maximum permission value
-```
-
-**Implementation scope:**
-
-- `gate.py` — Add `Verdict.MODIFY`, implement `_handle_modify()` that rewrites tool call parameters
-- `classifier_base.py` — `ClassificationResult` carries modification rules when matched
-- `mcp_proxy.py` — Forward modified parameters to server instead of original
-- `audit.py` — Log both original and modified parameters for forensic trail
-- Agent feedback — Tell the agent what was modified and why
-
-**What this unlocks:**
-
-- "Allow with guardrails" posture instead of binary allow/deny
-- Safer agent autonomy — more actions can proceed (modified) rather than being blocked
-- Competitive differentiator against every tool that only does allow/block
+- `Verdict.MODIFY` in gate evaluation pipeline
+- Five modify operations: clamp_permission, strip_flags, require_flags, append_arg, max_depth
+- Reinvocation loop in MCP proxy (depth cap = 1)
+- Pattern-level `vault: skip` for permission/ownership changes
+- `args_match` regex-based argument matching
+- Combined audit records with original + modified parameters
+- OPA backend modifications rule support
+- ~115 new tests (total ~428)
 
 ### AARM Advancement
 
@@ -405,7 +363,8 @@ Multiple rate limit profiles (conservative/standard/permissive) that agents grad
 |---|---|---|---|
 | **v0.2.0** | — | Rate limiting, circuit breaker, policy hash | ✅ Released 2026-02-23 |
 | **v0.3.0** | Identity | Identity binding, RBAC, role-based policy overrides | ✅ Released 2026-02-23 |
-| **v0.4.0** | Enterprise | MODIFY decisions, cost tracking, telemetry export | April 2026 |
+| **v0.4.0** | Modify | MODIFY verdict, parameter rewriting, reinvocation loop | ✅ Released 2026-02-23 |
+| **v0.5.0** | Enterprise | Cost tracking, telemetry export | April 2026 |
 | **v0.5.0** | Receipts | Signed receipts, full non-repudiation | May 2026 |
 
 ### AARM Conformance Trajectory
@@ -414,8 +373,9 @@ Multiple rate limit profiles (conservative/standard/permissive) that agents grad
 |---|---|---|---|---|---|---|---|---|---|---|
 | **v0.2.0** | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ | ❌ | ⚠️ | ❌ | 1/6 satisfied |
 | **v0.3.0** | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ | ❌ | 1/6 satisfied, 5/6 partial |
-| **v0.4.0** | ✅ | ⚠️ | ⚠️ | ⚠️+ | ⚠️ | ⚠️ | ❌ | ✅ | ❌ | 2/6 satisfied |
-| **v0.5.0** | ✅ | ⚠️ | ⚠️ | ⚠️+ | ✅ | ⚠️ | ❌ | ✅ | ❌ | 3/6 satisfied |
+| **v0.4.0** | ✅ | ⚠️ | ⚠️ | ⚠️+ | ⚠️+ | ⚠️ | ❌ | ⚠️ | ❌ | 1/6 satisfied, 5/6 partial (improved) |
+| **v0.5.0** | ✅ | ⚠️ | ⚠️ | ⚠️+ | ⚠️ | ⚠️ | ❌ | ✅ | ❌ | 2/6 satisfied |
+| **v0.6.0** | ✅ | ⚠️ | ⚠️ | ⚠️+ | ✅ | ⚠️ | ❌ | ✅ | ❌ | 3/6 satisfied |
 
 ### NIST SP 800-53 Gap Trajectory
 
@@ -423,7 +383,8 @@ Multiple rate limit profiles (conservative/standard/permissive) that agents grad
 |---|---|---|---|
 | **v0.2.0** | 1 (AC-3(7)) | 22 of 29 | Rate limiting closed AU-9(3) and AU-10 gaps |
 | **v0.3.0** | 0 | 23 of 31 | Identity closes AC-3(7), adds IA-2 and IA-4 |
-| **v0.5.0** | 0 | 26 of 33 | Signed receipts fully satisfies AU-10 |
+| **v0.4.0** | 0 | 23 of 31 | MODIFY adds CM-3, SI-10, AU-12 mappings (already counted) |
+| **v0.6.0** | 0 | 26 of 33 | Signed receipts fully satisfies AU-10 |
 
 ---
 

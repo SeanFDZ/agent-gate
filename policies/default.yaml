@@ -49,9 +49,13 @@ actions:
         args_contain: ["-i"]
         description: "In-place file edit"
       - command: "chmod"
-        description: "Permission change — backup metadata"
+        description: "Permission change, audit only"
+        vault: skip
+        modify:
+          clamp_permission: "755"
       - command: "chown"
-        description: "Ownership change — backup metadata"
+        description: "Ownership change, audit only"
+        vault: skip
       - command: "cp"
         condition: "target_exists"
         description: "Copy that overwrites existing target"

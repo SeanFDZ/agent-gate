@@ -61,6 +61,11 @@ class AuditRecord:
     agent_id: Optional[str] = None         # Unique agent instance identifier
     service_account: Optional[str] = None  # Service-level identity (CI, deploy)
     role: Optional[str] = None             # Role for RBAC policy differentiation
+    # MODIFY fields (Phase 7.5) -- capture both original and rewritten calls
+    original_tool_call: Optional[dict] = None    # Unmodified call as agent submitted
+    modified_tool_call: Optional[dict] = None    # Rewritten call forwarded to server
+    modification_rule: Optional[dict] = None     # {rule_id, description, operations_applied}
+    reinvocation_verdict: Optional[str] = None   # Verdict from second gate evaluation
 
     def _content_for_hashing(self) -> str:
         """
@@ -211,6 +216,11 @@ class AuditLogger:
         agent_id: Optional[str] = None,
         service_account: Optional[str] = None,
         role: Optional[str] = None,
+        # MODIFY fields (Phase 7.5)
+        original_tool_call: Optional[dict] = None,
+        modified_tool_call: Optional[dict] = None,
+        modification_rule: Optional[dict] = None,
+        reinvocation_verdict: Optional[str] = None,
     ) -> None:
         """
         Convenience method to log a tool call with common fields.
@@ -234,6 +244,10 @@ class AuditLogger:
             agent_id=agent_id,
             service_account=service_account,
             role=role,
+            original_tool_call=original_tool_call,
+            modified_tool_call=modified_tool_call,
+            modification_rule=modification_rule,
+            reinvocation_verdict=reinvocation_verdict,
         )
         self.log(record)
 

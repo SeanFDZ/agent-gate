@@ -60,6 +60,8 @@ def generate_pattern_key(
     if "args_contain" in pattern:
         suffix = _args_to_suffix(pattern["args_contain"])
         key = f"{command}_{suffix}"
+    elif "args_match" in pattern and command in existing_keys:
+        key = f"{command}_match"
     elif "condition" in pattern and command in existing_keys:
         suffix = _condition_to_suffix(pattern["condition"])
         key = f"{command}_{suffix}"
@@ -105,13 +107,31 @@ def _format_pattern_entry(key: str, pattern: dict) -> str:
             f'"{_escape_rego(a)}"' for a in pattern["args_contain"]
         )
         fields.append(f'"args_contain": [{args_str}]')
+    if "args_match" in pattern:
+        fields.append(f'"args_match": "{_escape_rego(pattern["args_match"])}"')
     if "condition" in pattern:
         fields.append(f'"condition": "{_escape_rego(pattern["condition"])}"')
     if "description" in pattern:
         fields.append(f'"description": "{_escape_rego(pattern["description"])}"')
+    if "vault" in pattern:
+        fields.append(f'"vault": "{_escape_rego(pattern["vault"])}"')
+    if "modify" in pattern:
+        # Encode modify block as JSON-like Rego object
+        modify_fields = []
+        for op_name, op_value in pattern["modify"].items():
+            if isinstance(op_value, list):
+                items = ", ".join(f'"{_escape_rego(v)}"' for v in op_value)
+                modify_fields.append(f'"{op_name}": [{items}]')
+            elif isinstance(op_value, int):
+                modify_fields.append(f'"{op_name}": {op_value}')
+            else:
+                modify_fields.append(
+                    f'"{op_name}": "{_escape_rego(str(op_value))}"'
+                )
+        fields.append('"modify": {' + ", ".join(modify_fields) + '}')
 
-    # Use multi-line for complex patterns, single-line for simple ones
-    if "args_contain" in pattern or "condition" in pattern:
+    # Use multi-line for complex patterns
+    if len(fields) > 3:
         lines = [f'    "{_escape_rego(key)}": {{']
         for field in fields:
             lines.append(f"        {field},")
@@ -158,30 +178,75 @@ def generate_tier_patterns(tier_name: str, patterns: list) -> str:
     return "\n".join(lines)
 
 
-def generate_tier_result_rules(tier_name: str, has_args_contain: bool) -> str:
+def generate_tier_result_rules(
+    tier_name: str, has_args_contain: bool, has_args_match: bool = False
+) -> str:
     """Generate the result matching rules for a tier."""
-    if has_args_contain:
-        return (
-            f"{tier_name}_result[name] := pattern if {{\n"
-            f"    some name, pattern in {tier_name}_patterns\n"
-            f"    pattern.command == input.command\n"
-            f"    not pattern.args_contain\n"
-            f"}}\n"
-            f"\n"
-            f"{tier_name}_result[name] := pattern if {{\n"
-            f"    some name, pattern in {tier_name}_patterns\n"
-            f"    pattern.command == input.command\n"
-            f"    pattern.args_contain\n"
-            f"    args_contain_match(pattern.args_contain)\n"
-            f"}}"
-        )
+    rules = []
+
+    # Base rule: command match only (no args_contain, no args_match)
+    base_rule = (
+        "{tier}_result[name] := pattern if {{\n"
+        "    some name, pattern in {tier}_patterns\n"
+        "    pattern.command == input.command\n"
+        "    not pattern.args_contain\n"
+        "    not pattern.args_match\n"
+        "}}"
+    ).format(tier=tier_name)
+
+    # Simple base rule when neither args_contain nor args_match present
+    simple_base = (
+        "{tier}_result[name] := pattern if {{\n"
+        "    some name, pattern in {tier}_patterns\n"
+        "    pattern.command == input.command\n"
+        "}}"
+    ).format(tier=tier_name)
+
+    if not has_args_contain and not has_args_match:
+        rules.append(simple_base)
     else:
-        return (
-            f"{tier_name}_result[name] := pattern if {{\n"
-            f"    some name, pattern in {tier_name}_patterns\n"
-            f"    pattern.command == input.command\n"
-            f"}}"
-        )
+        rules.append(base_rule)
+
+    if has_args_contain:
+        rule = (
+            "{tier}_result[name] := pattern if {{\n"
+            "    some name, pattern in {tier}_patterns\n"
+            "    pattern.command == input.command\n"
+            "    pattern.args_contain\n"
+            "    not pattern.args_match\n"
+            "    args_contain_match(pattern.args_contain)\n"
+            "}}"
+        ).format(tier=tier_name)
+        rules.append(rule)
+
+    if has_args_match:
+        rule = (
+            "{tier}_result[name] := pattern if {{\n"
+            "    some name, pattern in {tier}_patterns\n"
+            "    pattern.command == input.command\n"
+            "    pattern.args_match\n"
+            "    not pattern.args_contain\n"
+            "    regex.match(pattern.args_match, "
+            'concat(" ", array.concat([input.command], input.args)))\n'
+            "}}"
+        ).format(tier=tier_name)
+        rules.append(rule)
+
+    if has_args_contain and has_args_match:
+        rule = (
+            "{tier}_result[name] := pattern if {{\n"
+            "    some name, pattern in {tier}_patterns\n"
+            "    pattern.command == input.command\n"
+            "    pattern.args_contain\n"
+            "    pattern.args_match\n"
+            "    args_contain_match(pattern.args_contain)\n"
+            "    regex.match(pattern.args_match, "
+            'concat(" ", array.concat([input.command], input.args)))\n'
+            "}}"
+        ).format(tier=tier_name)
+        rules.append(rule)
+
+    return "\n\n".join(rules)
 
 
 def generate_gate_behavior(policy: dict) -> str:
@@ -211,6 +276,103 @@ def generate_vault_config(policy: dict) -> str:
     vault = policy.get("vault", {})
     on_failure = vault.get("on_failure", "deny")
     return f'vault_on_failure := "{_escape_rego(on_failure)}"'
+
+
+# =========================================================================
+# MODIFICATIONS GENERATORS
+# =========================================================================
+
+
+def generate_modifications_rules(policy: dict) -> str:
+    """Generate Rego modifications rules from patterns with modify blocks.
+
+    Produces a modifications[patch] rule set that returns patch objects
+    for patterns that have modify blocks.  The gate queries this alongside
+    the main decision rule.
+    """
+    lines = []
+    lines.append("# Modifications: patterns with modify blocks")
+    lines.append("# Non-empty modifications + denied decision signals MODIFY")
+
+    actions = policy.get("actions", {})
+    has_any = False
+
+    for tier_name in TIER_ORDER:
+        if tier_name not in actions:
+            continue
+        patterns = actions[tier_name].get("patterns", [])
+        for pattern in patterns:
+            if "modify" not in pattern:
+                continue
+            has_any = True
+            cmd = pattern["command"]
+            desc = pattern.get("description", "")
+
+            # Build the condition body
+            conditions = [
+                '    input.command == "{}"'.format(_escape_rego(cmd))
+            ]
+            if "args_contain" in pattern:
+                conditions.append(
+                    "    args_contain_match(pattern.args_contain)"
+                )
+            if "args_match" in pattern:
+                conditions.append(
+                    '    regex.match("{}", '
+                    'concat(" ", array.concat([input.command], '
+                    "input.args)))".format(
+                        _escape_rego(pattern["args_match"])
+                    )
+                )
+
+            # Build the modify block as a Rego object
+            modify_parts = []
+            for op_name, op_value in pattern["modify"].items():
+                if isinstance(op_value, list):
+                    items = ", ".join(
+                        '"{}"'.format(_escape_rego(v)) for v in op_value
+                    )
+                    modify_parts.append('"{}": [{}]'.format(op_name, items))
+                elif isinstance(op_value, int):
+                    modify_parts.append('"{}": {}'.format(op_name, op_value))
+                else:
+                    modify_parts.append(
+                        '"{}": "{}"'.format(
+                            op_name, _escape_rego(str(op_value))
+                        )
+                    )
+
+            modify_obj = "{" + ", ".join(modify_parts) + "}"
+
+            lines.append("")
+            lines.append("modifications[patch] if {")
+            for cond in conditions:
+                lines.append(cond)
+            lines.append("    patch := {")
+            lines.append(
+                '        "command": "{}",'.format(_escape_rego(cmd))
+            )
+            lines.append(
+                '        "description": "{}",'.format(_escape_rego(desc))
+            )
+            lines.append(
+                '        "modify": {},'.format(modify_obj)
+            )
+            if "vault" in pattern:
+                lines.append(
+                    '        "vault": "{}",'.format(
+                        _escape_rego(pattern["vault"])
+                    )
+                )
+            lines.append("    }")
+            lines.append("}")
+
+    if not has_any:
+        lines.append("")
+        lines.append("# No modify patterns defined")
+        lines.append("modifications := set()")
+
+    return "\n".join(lines)
 
 
 # =========================================================================
@@ -985,6 +1147,7 @@ def generate_rego(policy: dict, source_file: str = "policy.yaml") -> str:
             continue
 
         has_args_contain = any("args_contain" in p for p in patterns)
+        has_args_match = any("args_match" in p for p in patterns)
 
         # Section header
         section_name = TIER_SECTION_NAMES.get(tier, f"{tier.upper()} TIER")
@@ -1003,7 +1166,9 @@ def generate_rego(policy: dict, source_file: str = "policy.yaml") -> str:
             args_contain_emitted = True
 
         # Result rules
-        sections.append(generate_tier_result_rules(tier, has_args_contain))
+        sections.append(generate_tier_result_rules(
+            tier, has_args_contain, has_args_match
+        ))
 
     # 5. Gate behavior
     sections.append(
@@ -1039,7 +1204,15 @@ def generate_rego(policy: dict, source_file: str = "policy.yaml") -> str:
     sections.append(generate_identity_data(policy))
     sections.append(generate_identity_rules())
 
-    # 7. Decision rules (conditionally includes rate limit and identity decisions)
+    # 8. Modifications rules (for MODIFY verdict support)
+    sections.append(
+        "# =========================================================================\n"
+        "# MODIFICATIONS (patterns with modify blocks)\n"
+        "# ========================================================================="
+    )
+    sections.append(generate_modifications_rules(policy))
+
+    # 9. Decision rules (conditionally includes rate limit and identity decisions)
     sections.append(generate_decision_rules(
         has_rate_limits=bool(rate_limits),
         has_identity=has_identity,
