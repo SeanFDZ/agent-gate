@@ -36,15 +36,18 @@ from dataclasses import dataclass, field
 
 class ActionTier(Enum):
     """
-    The five possible classifications for any action.
+    The six possible classifications for any action.
     Ordered by severity — check blocked first, then destructive,
     then network, then read_only, then fall through to unclassified.
+    RATE_LIMITED is assigned when a rate limit or circuit breaker
+    denies the action before classification.
     """
     BLOCKED = "blocked"
     DESTRUCTIVE = "destructive"
     NETWORK = "network"
     READ_ONLY = "read_only"
     UNCLASSIFIED = "unclassified"
+    RATE_LIMITED = "rate_limited"
 
 
 @dataclass

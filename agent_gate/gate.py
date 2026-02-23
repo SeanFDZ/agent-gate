@@ -16,6 +16,7 @@ verify that the proposed action falls within the authority envelope.
 
 import json
 import logging
+import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 from enum import Enum
@@ -26,6 +27,7 @@ from agent_gate.policy_loader import Policy, load_policy
 from agent_gate.classifier_base import ActionTier, ClassificationResult
 from agent_gate.classifier import PythonClassifier, ActionClassifier
 from agent_gate.vault import VaultManager, VaultResult
+from agent_gate.rate_tracker import RateTracker
 
 
 class Verdict(Enum):
@@ -54,6 +56,7 @@ class GateDecision:
     timestamp: str = ""
     escalation_hint: str = ""
     denial_feedback: str = ""
+    rate_status: Optional[dict] = None
 
     def __post_init__(self):
         if not self.timestamp:
@@ -65,7 +68,7 @@ class GateDecision:
 
     def to_dict(self) -> dict:
         """Serialize for logging and feedback to the agent."""
-        return {
+        d = {
             "verdict": self.verdict.value,
             "reason": self.reason,
             "timestamp": self.timestamp,
@@ -81,6 +84,9 @@ class GateDecision:
                 else 0
             ),
         }
+        if self.rate_status:
+            d["rate_status"] = self.rate_status
+        return d
 
     def to_agent_message(self) -> str:
         """
@@ -95,6 +101,22 @@ class GateDecision:
 
         if self.denial_feedback:
             lines.append(f"DETAILS: {self.denial_feedback}")
+
+        # Rate status or breaker status line for rate-limited denials.
+        if self.rate_status:
+            rs = self.rate_status
+            source = rs.get("source", "unknown")
+            if source == "circuit_breaker":
+                lines.append(
+                    f"BREAKER STATUS: state={rs.get('breaker_state', 'unknown')}, "
+                    f"recovery_in={rs.get('reset_seconds', '?')}s"
+                )
+            else:
+                remaining = rs.get("remaining", "?")
+                lines.append(
+                    f"RATE STATUS: {source}_remaining={remaining}, "
+                    f"breaker={rs.get('breaker_state', 'closed')}"
+                )
 
         if self.escalation_hint:
             lines.append(f"TO PROCEED: {self.escalation_hint}")
@@ -138,6 +160,9 @@ class Gate:
         )
         self.vault = VaultManager(self.policy.vault_config)
         self.logger = self._setup_logger()
+
+        # Rate tracker (optional — only active if policy has rate_limits).
+        self.rate_tracker = RateTracker(self.policy.rate_limits)
 
         self.logger.info(json.dumps({
             "event": "gate_initialized",
@@ -189,8 +214,19 @@ class Gate:
         """
         Evaluate a single tool call against policy.
 
-        This is the main entry point. Every tool call passes through
+        This is the main entry point.  Every tool call passes through
         here before execution.
+
+        Flow:
+          0. Extract tool name for rate tracking.
+          1. Check circuit breaker state.
+          2. Check tool-specific and global rate limits (tier unknown).
+          3. Classify the action (existing flow).
+          4. Check tier-default rate limits (tier now known).
+          5. Record the call for rate tracking.
+          6. Route based on classification tier (existing flow).
+          7. Record outcome for circuit breaker.
+          8. Log the decision.
 
         Args:
             tool_call: Structured tool call dict, e.g.:
@@ -202,10 +238,41 @@ class Gate:
         Returns:
             GateDecision with verdict, reason, and vault info.
         """
-        # Step 1: Classify the action
+        # Step 0: Extract tool name for rate tracking.
+        tool_name = self._extract_tool_name(tool_call)
+
+        # Step 1: Check circuit breaker state.
+        breaker_result = self._check_circuit_breaker(tool_name, tool_call)
+        if breaker_result is not None:
+            self._log_decision(breaker_result)
+            return breaker_result
+
+        # Step 2: Check tool-specific and global rate limits.
+        # Tier is unknown before classification, so we pass None.
+        rate_result = self._check_tool_rate_limit(tool_name, tool_call)
+        if rate_result is not None:
+            self.rate_tracker.record_outcome(tool_name, False, 0)
+            self._log_decision(rate_result)
+            return rate_result
+
+        # Step 3: Classify the action (existing flow).
         classification = self.classifier.classify(tool_call)
 
-        # Step 2: Route based on classification tier
+        # Step 4: Check tier-default rate limits (tier now known).
+        tier_rate_result = self._check_tier_rate_limit(
+            tool_name, classification.tier.value, tool_call
+        )
+        if tier_rate_result is not None:
+            self.rate_tracker.record_outcome(tool_name, False, 0)
+            self._log_decision(tier_rate_result)
+            return tier_rate_result
+
+        # Step 5: Record the call for rate tracking.
+        self.rate_tracker.record_call(
+            tool_name, classification.tier.value
+        )
+
+        # Step 6: Route based on classification tier (existing flow).
         if classification.tier == ActionTier.BLOCKED:
             decision = self._handle_blocked(tool_call, classification)
 
@@ -224,10 +291,225 @@ class Gate:
         else:
             decision = self._handle_unclassified(tool_call, classification)
 
-        # Step 3: Log the decision
+        # Step 7: Record outcome for circuit breaker.
+        success = decision.verdict == Verdict.ALLOW
+        self.rate_tracker.record_outcome(tool_name, success, 0)
+
+        # Step 8: Log the decision.
         self._log_decision(decision)
 
         return decision
+
+    # ------------------------------------------------------------------
+    # Rate limiting helpers
+    # ------------------------------------------------------------------
+
+    def _extract_tool_name(self, tool_call: dict) -> str:
+        """
+        Extract the command/tool name from the tool call dict.
+
+        Uses the same logic as the classifier's _parse_tool_call so
+        rate limit keys match classification keys.
+        """
+        tool = tool_call.get("tool", "")
+        input_data = tool_call.get("input", {})
+
+        if tool == "bash":
+            raw_command = input_data.get("command", "")
+            try:
+                parts = shlex.split(raw_command)
+            except ValueError:
+                parts = raw_command.split()
+            return parts[0] if parts else "unknown"
+
+        return tool or "unknown"
+
+    def _check_circuit_breaker(
+        self, tool_name: str, tool_call: dict
+    ) -> Optional[GateDecision]:
+        """Check if the circuit breaker blocks this call."""
+        state = self.rate_tracker.breaker_state
+        if not state or state.value == "closed":
+            return None
+
+        # In HALF_OPEN, allow limited probe calls.
+        if state.value == "half_open":
+            return None
+
+        # OPEN — deny the action.
+        breaker = self.rate_tracker.circuit_breaker
+        trip_reason = (
+            breaker.trip_reason()
+            if breaker
+            else "Circuit breaker open."
+        )
+
+        classification = ClassificationResult(
+            tier=ActionTier.RATE_LIMITED,
+            command=tool_name,
+            args=[],
+            target_paths=[],
+            reason=trip_reason,
+        )
+
+        secs = breaker.seconds_until_half_open() if breaker else 0
+
+        rate_status = {
+            "source": "circuit_breaker",
+            "limit": 0,
+            "current": 0,
+            "remaining": 0,
+            "window_seconds": 0,
+            "reset_seconds": round(secs, 1),
+            "breaker_state": state.value,
+            "backoff_seconds": 0,
+        }
+
+        return GateDecision(
+            verdict=Verdict.DENY,
+            tool_call=tool_call,
+            classification=classification,
+            reason=trip_reason,
+            denial_feedback=(
+                "Circuit breaker is OPEN due to elevated failure rate."
+            ),
+            escalation_hint=(
+                "Wait for the circuit breaker to transition to HALF_OPEN "
+                f"(~{secs:.0f}s), "
+                "or request human intervention to reset."
+            ),
+            rate_status=rate_status,
+        )
+
+    def _check_tool_rate_limit(
+        self, tool_name: str, tool_call: dict
+    ) -> Optional[GateDecision]:
+        """
+        Check tool-specific and global rate limits.
+
+        Called before classification, so tier is None (tier-default
+        limits are checked after classification in _check_tier_rate_limit).
+        """
+        limit_info = self.rate_tracker.check_rate_limit(tool_name, None)
+        if limit_info is None:
+            return None
+        # Skip circuit breaker results (handled in _check_circuit_breaker).
+        if limit_info.get("source") == "circuit_breaker":
+            return None
+        return self._build_rate_limit_decision(
+            tool_name, tool_call, limit_info
+        )
+
+    def _check_tier_rate_limit(
+        self, tool_name: str, tier: str, tool_call: dict
+    ) -> Optional[GateDecision]:
+        """
+        Check tier-default rate limits after classification.
+
+        Called after classification, so tier is known.  Re-checks
+        via check_rate_limit which also re-validates tool and global,
+        but those were already verified in _check_tool_rate_limit
+        and counters have not been incremented in between.
+        """
+        limit_info = self.rate_tracker.check_rate_limit(tool_name, tier)
+        if limit_info is None:
+            return None
+        # Skip circuit breaker and tool/global (already checked).
+        if limit_info.get("source") in ("circuit_breaker", "tool", "global"):
+            return None
+        return self._build_rate_limit_decision(
+            tool_name, tool_call, limit_info
+        )
+
+    def _build_rate_limit_decision(
+        self, tool_name: str, tool_call: dict, limit_info: dict
+    ) -> GateDecision:
+        """Build a GateDecision from a rate limit check result."""
+        on_exceed = limit_info.get("on_exceed", "deny")
+        message = limit_info.get("message", "Rate limit exceeded.")
+
+        # Map on_exceed to verdict.
+        if on_exceed == "escalate":
+            verdict = Verdict.ESCALATE
+        elif on_exceed == "read_only":
+            verdict = Verdict.DENY
+            message = (
+                "Rate limit exceeded.  "
+                "Only read-only operations are currently allowed."
+            )
+        else:
+            verdict = Verdict.DENY
+
+        classification = ClassificationResult(
+            tier=ActionTier.RATE_LIMITED,
+            command=tool_name,
+            args=[],
+            target_paths=[],
+            reason=message,
+        )
+
+        remaining = limit_info.get("rate_remaining", 0)
+        reset_seconds = limit_info.get("reset_seconds", 0)
+
+        denial_feedback = (
+            f"{message}  "
+            f"Remaining: {remaining:.0f}, "
+            f"resets in {reset_seconds:.0f}s."
+        )
+
+        if on_exceed == "escalate":
+            escalation_hint = (
+                "Rate limit exceeded.  "
+                "Human approval required to continue."
+            )
+        elif on_exceed == "read_only":
+            escalation_hint = (
+                "Switch to read-only operations until the "
+                "rate limit resets."
+            )
+        else:
+            escalation_hint = (
+                f"Wait {reset_seconds:.0f}s for the rate limit to reset, "
+                f"or request a policy change."
+            )
+
+        # Add retry_after if backoff is configured.
+        if "retry_after_seconds" in limit_info:
+            escalation_hint += (
+                f"  Suggested retry after "
+                f"{limit_info['retry_after_seconds']:.0f}s."
+            )
+
+        # Build rate_status for agent feedback.
+        rate_status = {
+            "source": limit_info.get("source", "unknown"),
+            "limit": limit_info.get("rate_limit", 0),
+            "current": int(round(limit_info.get("current_count", 0))),
+            "remaining": int(round(remaining)),
+            "window_seconds": limit_info.get("window_seconds", 0),
+            "reset_seconds": round(reset_seconds, 1),
+            "breaker_state": limit_info.get(
+                "breaker_state",
+                self.rate_tracker.breaker_state.value,
+            ),
+            "backoff_seconds": limit_info.get(
+                "retry_after_seconds", 0
+            ),
+        }
+
+        return GateDecision(
+            verdict=verdict,
+            tool_call=tool_call,
+            classification=classification,
+            reason=message,
+            denial_feedback=denial_feedback,
+            escalation_hint=escalation_hint,
+            rate_status=rate_status,
+        )
+
+    # ------------------------------------------------------------------
+    # Classification condition evaluation
+    # ------------------------------------------------------------------
 
     def _evaluate_conditions(
         self, classification: ClassificationResult
@@ -499,4 +781,10 @@ class Gate:
         if decision.verdict == Verdict.DENY and not log_config.get("log_denied", True):
             return
 
-        self.logger.info(json.dumps(decision.to_dict()))
+        log_entry = decision.to_dict()
+        log_entry["policy_hash"] = self.policy.policy_hash
+
+        if decision.classification.tier == ActionTier.RATE_LIMITED:
+            log_entry["rate_context"] = self.rate_tracker.get_rate_context()
+
+        self.logger.info(json.dumps(log_entry))

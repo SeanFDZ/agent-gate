@@ -268,6 +268,7 @@ class MCPProxy:
             _log(f"Gate evaluation error: {e}")
             # On gate error, deny for safety (fail closed)
             if self.audit:
+                ph = self.gate.policy.policy_hash if self.gate else None
                 self.audit.log_tool_call(
                     tool_name=tool_name,
                     arguments=tool_input,
@@ -275,6 +276,7 @@ class MCPProxy:
                     tier="error",
                     reason=f"Gate evaluation error: {e}",
                     msg_id=msg.msg_id,
+                    policy_hash=ph,
                 )
             return make_error_response(
                 msg.msg_id, -32603,
@@ -289,15 +291,25 @@ class MCPProxy:
             if hasattr(decision, 'vault_result') and decision.vault_result:
                 vault_path = getattr(decision.vault_result, 'backup_path', None)
 
+            tier_value = (
+                decision.classification.tier.value
+                if decision.classification else "unknown"
+            )
+            rate_ctx = None
+            if tier_value == "rate_limited" and self.gate:
+                rate_ctx = self.gate.rate_tracker.get_rate_context()
+
             self.audit.log_tool_call(
                 tool_name=tool_name,
                 arguments=tool_input,
                 verdict=decision.verdict.value,
-                tier=decision.classification.tier.value if decision.classification else "unknown",
+                tier=tier_value,
                 reason=decision.reason,
                 msg_id=msg.msg_id,
                 vault_path=vault_path,
                 duration_ms=round(duration_ms, 2),
+                policy_hash=self.gate.policy.policy_hash if self.gate else None,
+                rate_context=rate_ctx,
             )
 
         # Route based on verdict

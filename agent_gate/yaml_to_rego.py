@@ -214,6 +214,134 @@ def generate_vault_config(policy: dict) -> str:
 
 
 # =========================================================================
+# RATE LIMIT GENERATORS
+# =========================================================================
+
+
+def generate_rate_limit_data(rate_limits: dict) -> str:
+    """Generate Rego data objects from the YAML rate_limits section.
+
+    Emits per-tool configs, per-tier defaults, global config, and
+    circuit breaker config as Rego data assignments.
+    """
+    lines = []
+
+    # Per-tool rate limits.
+    tools = rate_limits.get("tools", {})
+    lines.append("# Per-tool rate limits")
+    lines.append("rate_limit_tools := {")
+    for tool_name, cfg in tools.items():
+        max_calls = cfg.get("max_calls", 100)
+        window = cfg.get("window_seconds", 60)
+        on_exceed = cfg.get("on_exceed", "deny")
+        message = cfg.get("message", "")
+        lines.append(f'    "{_escape_rego(tool_name)}": {{')
+        lines.append(f'        "max_calls": {max_calls},')
+        lines.append(f'        "window_seconds": {window},')
+        lines.append(f'        "on_exceed": "{_escape_rego(on_exceed)}",')
+        lines.append(f'        "message": "{_escape_rego(message)}",')
+        lines.append("    },")
+    lines.append("}")
+    lines.append("")
+
+    # Per-tier default rate limits.
+    tier_defaults = rate_limits.get("tier_defaults", {})
+    lines.append("# Per-tier default rate limits")
+    lines.append("rate_limit_tiers := {")
+    for tier_name, cfg in tier_defaults.items():
+        max_calls = cfg.get("max_calls", 100)
+        window = cfg.get("window_seconds", 60)
+        on_exceed = cfg.get("on_exceed", "deny")
+        lines.append(f'    "{_escape_rego(tier_name)}": {{')
+        lines.append(f'        "max_calls": {max_calls},')
+        lines.append(f'        "window_seconds": {window},')
+        lines.append(f'        "on_exceed": "{_escape_rego(on_exceed)}",')
+        lines.append("    },")
+    lines.append("}")
+    lines.append("")
+
+    # Global rate limit.
+    global_cfg = rate_limits.get("global", {})
+    max_calls = global_cfg.get("max_calls", 200)
+    window = global_cfg.get("window_seconds", 60)
+    on_exceed = global_cfg.get("on_exceed", "read_only")
+    message = global_cfg.get(
+        "message", "Global rate limit exceeded."
+    )
+    lines.append("# Global rate limit")
+    lines.append("rate_limit_global := {")
+    lines.append(f'    "max_calls": {max_calls},')
+    lines.append(f'    "window_seconds": {window},')
+    lines.append(f'    "on_exceed": "{_escape_rego(on_exceed)}",')
+    lines.append(f'    "message": "{_escape_rego(message)}",')
+    lines.append("}")
+    lines.append("")
+
+    # Circuit breaker config.
+    breaker = rate_limits.get("circuit_breaker", {})
+    enabled_str = "true" if breaker.get("enabled", False) else "false"
+    failure_threshold = breaker.get("failure_rate_threshold", 0.50)
+    on_trip = breaker.get("on_trip", "read_only")
+    breaker_message = breaker.get(
+        "message", "Circuit breaker tripped."
+    )
+    lines.append("# Circuit breaker config")
+    lines.append("circuit_breaker_config := {")
+    lines.append(f'    "enabled": {enabled_str},')
+    lines.append(f'    "failure_rate_threshold": {failure_threshold},')
+    lines.append(f'    "on_trip": "{_escape_rego(on_trip)}",')
+    lines.append(f'    "message": "{_escape_rego(breaker_message)}",')
+    lines.append("}")
+
+    return "\n".join(lines)
+
+
+def generate_rate_limit_rules() -> str:
+    """Generate Rego rules that evaluate rate_context against limits.
+
+    These rules check for the existence of input.rate_context before
+    firing, so they are inert when rate_context is absent from the
+    OPA input (e.g., when the Python classifier path is used).
+    """
+    return """\
+# Tool rate limit check
+tool_rate_exceeded[tool_name] := config if {
+    input.rate_context
+    some tool_name, config in rate_limit_tools
+    tool_name == input.command
+    tool_count := input.rate_context.tool_counts[tool_name]
+    tool_count.count > config.max_calls
+}
+
+# Tier rate limit check
+tier_rate_exceeded[tier_name] := config if {
+    input.rate_context
+    some tier_name, config in rate_limit_tiers
+    tier_count := input.rate_context.tier_counts[tier_name]
+    tier_count.count > config.max_calls
+}
+
+# Global rate limit check
+global_rate_exceeded if {
+    input.rate_context
+    input.rate_context.global_count.count > rate_limit_global.max_calls
+}
+
+# Circuit breaker check
+breaker_tripped if {
+    input.rate_context
+    circuit_breaker_config.enabled
+    input.rate_context.breaker_state == "open"
+}
+
+# Aggregate: any rate limit or breaker is active
+any_rate_limit_active if { breaker_tripped }
+any_rate_limit_active if { count(tool_rate_exceeded) > 0 }
+any_rate_limit_active if { count(tier_rate_exceeded) > 0 }
+any_rate_limit_active if { global_rate_exceeded }"""
+
+
+# =========================================================================
 # STATIC REGO TEMPLATES
 # =========================================================================
 
@@ -276,7 +404,7 @@ args_contain_match(triggers) if {
     contains(full_str, trigger)
 }"""
 
-DECISION_RULES = """\
+DECISION_RULES_ENVELOPE = """\
 # =========================================================================
 # DECISION — evaluated in severity order
 # =========================================================================
@@ -292,7 +420,73 @@ decision := result if {
         "paths_outside_envelope": outside,
         "matched_pattern": null,
     }
+}"""
+
+DECISION_RULES_RATE_LIMIT = """\
+
+# Priority 1.5: Circuit breaker tripped -> rate_limited
+decision := result if {
+    all_paths_in_envelope
+    breaker_tripped
+    result := {
+        "tier": "rate_limited",
+        "reason": circuit_breaker_config.message,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": null,
+        "rate_action": circuit_breaker_config.on_trip,
+    }
 }
+
+# Priority 1.6: Per-tool rate limit exceeded
+decision := result if {
+    all_paths_in_envelope
+    not breaker_tripped
+    some tool_name, config in tool_rate_exceeded
+    result := {
+        "tier": "rate_limited",
+        "reason": config.message,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": null,
+        "rate_action": config.on_exceed,
+    }
+}
+
+# Priority 1.7: Per-tier rate limit exceeded
+decision := result if {
+    all_paths_in_envelope
+    not breaker_tripped
+    count(tool_rate_exceeded) == 0
+    some tier_name, config in tier_rate_exceeded
+    result := {
+        "tier": "rate_limited",
+        "reason": concat("", [tier_name, " tier rate limit exceeded."]),
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": null,
+        "rate_action": config.on_exceed,
+    }
+}
+
+# Priority 1.8: Global rate limit exceeded
+decision := result if {
+    all_paths_in_envelope
+    not breaker_tripped
+    count(tool_rate_exceeded) == 0
+    count(tier_rate_exceeded) == 0
+    global_rate_exceeded
+    result := {
+        "tier": "rate_limited",
+        "reason": rate_limit_global.message,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": null,
+        "rate_action": rate_limit_global.on_exceed,
+    }
+}"""
+
+DECISION_RULES_TIERS = """\
 
 # Priority 2: Blocked tier match
 decision := result if {
@@ -360,6 +554,97 @@ default decision := {
     "paths_outside_envelope": [],
     "matched_pattern": null,
 }"""
+
+DECISION_RULES_TIERS_WITH_RATE = """\
+
+# Priority 2: Blocked tier match (rate limits take precedence)
+decision := result if {
+    all_paths_in_envelope
+    not any_rate_limit_active
+    some name, pattern in blocked_result
+    result := {
+        "tier": "blocked",
+        "reason": pattern.description,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 3: Destructive tier match (only if not blocked)
+decision := result if {
+    all_paths_in_envelope
+    not any_rate_limit_active
+    count(blocked_result) == 0
+    some name, pattern in destructive_result
+    result := {
+        "tier": "destructive",
+        "reason": pattern.description,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 4: Network tier (only if not blocked or destructive)
+decision := result if {
+    all_paths_in_envelope
+    not any_rate_limit_active
+    count(blocked_result) == 0
+    count(destructive_result) == 0
+    some name, pattern in network_result
+    result := {
+        "tier": "network",
+        "reason": pattern.description,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 5: Read-only (only if nothing higher matched)
+decision := result if {
+    all_paths_in_envelope
+    not any_rate_limit_active
+    count(blocked_result) == 0
+    count(destructive_result) == 0
+    count(network_result) == 0
+    some name, pattern in read_only_result
+    result := {
+        "tier": "read_only",
+        "reason": "Read-only action within envelope",
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 6: Unclassified (nothing matched)
+default decision := {
+    "tier": "unclassified",
+    "reason": "No matching pattern in policy. Requires human review.",
+    "paths_in_envelope": true,
+    "paths_outside_envelope": [],
+    "matched_pattern": null,
+}"""
+
+
+def generate_decision_rules(has_rate_limits: bool) -> str:
+    """Generate the decision rules, conditionally including rate limits.
+
+    When has_rate_limits is True, rate limit decision rules are inserted
+    between the envelope violation check and the blocked tier check.
+    The tier rules include a not any_rate_limit_active guard so that
+    rate limit decisions take precedence without conflict.
+    When False, the output is identical to the previous static string.
+    """
+    parts = [DECISION_RULES_ENVELOPE]
+    if has_rate_limits:
+        parts.append(DECISION_RULES_RATE_LIMIT)
+        parts.append(DECISION_RULES_TIERS_WITH_RATE)
+    else:
+        parts.append(DECISION_RULES_TIERS)
+    return "".join(parts)
 
 
 # =========================================================================
@@ -443,8 +728,19 @@ def generate_rego(policy: dict, source_file: str = "policy.yaml") -> str:
     # 6. Vault config
     sections.append(generate_vault_config(policy))
 
-    # 7. Decision rules
-    sections.append(DECISION_RULES)
+    # 6.5. Rate limits (if present)
+    rate_limits = policy.get("rate_limits", {})
+    if rate_limits:
+        sections.append(
+            "# =========================================================================\n"
+            "# RATE LIMITS (auto-generated from YAML)\n"
+            "# ========================================================================="
+        )
+        sections.append(generate_rate_limit_data(rate_limits))
+        sections.append(generate_rate_limit_rules())
+
+    # 7. Decision rules (conditionally includes rate limit decisions)
+    sections.append(generate_decision_rules(has_rate_limits=bool(rate_limits)))
 
     return "\n\n".join(sections) + "\n"
 
@@ -635,6 +931,99 @@ def generate_test_scaffold(policy: dict) -> str:
             test_lines.append('    d.tier == "read_only"')
             test_lines.append("}")
         parts.append("\n".join(test_lines))
+
+    # --- Rate limit tests (if rate_limits present) ---
+    rate_limits = policy.get("rate_limits", {})
+    if rate_limits:
+        # Pick first tool with an explicit on_exceed for test generation.
+        tools_cfg = rate_limits.get("tools", {})
+        test_tool = None
+        test_tool_max = 10
+        for tname, tcfg in tools_cfg.items():
+            if "on_exceed" in tcfg:
+                test_tool = tname
+                test_tool_max = tcfg.get("max_calls", 10)
+                break
+        if test_tool is None and tools_cfg:
+            test_tool = next(iter(tools_cfg))
+            test_tool_max = tools_cfg[test_tool].get("max_calls", 100)
+
+        global_max = rate_limits.get("global", {}).get("max_calls", 200)
+
+        rl_lines = [
+            "# =========================================================================",
+            "# RATE LIMIT TESTS",
+            "# =========================================================================",
+            "",
+            "# Helper: build input with rate context",
+            "make_rate_input(cmd, args, paths, tool_count, global_count, breaker) := {",
+            '    "command": cmd,',
+            '    "args": args,',
+            '    "target_paths": paths,',
+            '    "tool": "bash",',
+            '    "raw_input": {},',
+            '    "envelope": mock_envelope,',
+            '    "rate_context": {',
+            '        "tool_counts": {cmd: {"count": tool_count, "window_seconds": 60}},',
+            '        "tier_counts": {},',
+            '        "global_count": {"count": global_count, "window_seconds": 60},',
+            '        "breaker_state": breaker,',
+            "    },",
+            "}",
+        ]
+
+        if test_tool:
+            rl_lines.append("")
+            rl_lines.append("test_tool_rate_limit_exceeded if {")
+            rl_lines.append(
+                f'    d := decision with input as make_rate_input("{test_tool}", '
+                f'["/workspace/f.txt"], ["/workspace/f.txt"], '
+                f'{test_tool_max + 5}, 50, "closed")'
+            )
+            rl_lines.append('    d.tier == "rate_limited"')
+            rl_lines.append("}")
+            rl_lines.append("")
+            rl_lines.append("test_tool_rate_limit_not_exceeded if {")
+            rl_lines.append(
+                f'    d := decision with input as make_rate_input("{test_tool}", '
+                f'["/workspace/f.txt"], ["/workspace/f.txt"], '
+                f'{max(test_tool_max - 5, 1)}, 50, "closed")'
+            )
+            rl_lines.append('    d.tier != "rate_limited"')
+            rl_lines.append("}")
+
+        rl_lines.append("")
+        rl_lines.append("test_global_rate_limit_exceeded if {")
+        rl_lines.append(
+            f'    d := decision with input as make_rate_input("cat", '
+            f'["/workspace/f.txt"], ["/workspace/f.txt"], '
+            f'0, {global_max + 10}, "closed")'
+        )
+        rl_lines.append('    d.tier == "rate_limited"')
+        rl_lines.append("}")
+
+        breaker_cfg = rate_limits.get("circuit_breaker", {})
+        if breaker_cfg.get("enabled", False):
+            rl_lines.append("")
+            rl_lines.append("test_circuit_breaker_tripped if {")
+            rl_lines.append(
+                '    d := decision with input as make_rate_input("cat", '
+                '["/workspace/f.txt"], ["/workspace/f.txt"], '
+                '0, 0, "open")'
+            )
+            rl_lines.append('    d.tier == "rate_limited"')
+            rl_lines.append("}")
+
+        rl_lines.append("")
+        rl_lines.append("test_no_rate_context_no_rate_limit if {")
+        rl_lines.append(
+            '    d := decision with input as make_input("cat", '
+            '["/workspace/f.txt"], ["/workspace/f.txt"])'
+        )
+        rl_lines.append('    d.tier != "rate_limited"')
+        rl_lines.append("}")
+
+        parts.append("\n".join(rl_lines))
 
     # --- Unclassified test ---
     parts.append(

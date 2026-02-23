@@ -1,9 +1,9 @@
 # AARM Alignment Assessment — Agent Gate
 
-**Document version:** 0.1.0
-**Agent Gate version:** 0.1.0
+**Document version:** 0.2.0
+**Agent Gate version:** 0.2.0 (Phase 5: Rate Limiting & Circuit Breaker)
 **AARM Specification version:** v0.1
-**Date:** 2026-02-19
+**Date:** 2026-02-23
 **Status:** Gap analysis — this is NOT a conformance claim
 
 ---
@@ -36,12 +36,12 @@ Agent Gate's architecture places enforcement at the protocol boundary between cl
 
 ## Action Classification Mapping
 
-AARM defines four action categories. Agent Gate defines five action tiers. The mapping is partial:
+AARM defines four action categories. Agent Gate defines six action tiers. The mapping is partial, with recent progress on context-dependent decisions:
 
 | AARM Category | Description | Agent Gate Tier | Status |
 |---|---|---|---|
 | **Forbidden** | Always blocked regardless of context | `BLOCKED` | ✅ Direct mapping |
-| **Context-Dependent Deny** | Allowed by policy but blocked when context reveals inconsistency with intent | — | ❌ Not implemented — no context-awareness layer |
+| **Context-Dependent Deny** | Allowed by policy but blocked when context reveals inconsistency with intent | `RATE_LIMITED` | ⚠️ Partial — circuit breaker denies otherwise-allowed actions based on accumulated operational context (failure rates, tempo); not yet intent-aware |
 | **Context-Dependent Allow** | Denied by default but permitted when context confirms legitimate intent | — | ❌ Not implemented |
 | **Context-Dependent Defer** | Suspended when context is insufficient for a confident decision | — | ❌ Not implemented |
 
@@ -53,8 +53,9 @@ Agent Gate's additional tiers that do not map directly to AARM categories:
 | `NETWORK` | Default escalate for human approval | Partial — resembles STEP_UP but without context evaluation |
 | `READ_ONLY` | Auto-allow within envelope | Implicit allow — not a distinct AARM category |
 | `UNCLASSIFIED` | Default deny with feedback | Closest to Forbidden, but reason is lack of classification rather than policy prohibition |
+| `RATE_LIMITED` | Denied due to operational tempo violation | Context-Dependent Deny — same action is allowed when breaker is CLOSED but denied when OPEN |
 
-**Key gap:** AARM's classification framework is fundamentally context-dependent — an action's category can change based on accumulated session state. Agent Gate classifies actions based on static pattern matching against the tool call structure alone. Agent Gate evaluates the tuple `(action)` rather than AARM's required `(action, context)`.
+**Key gap (narrowing):** AARM's classification framework is fundamentally context-dependent — an action's category can change based on accumulated session state.  Agent Gate now has a limited form of this: the circuit breaker and rate limiter make authorization decisions that depend on accumulated operational context (call counts, failure rates, breaker state).  The same `rm` command is allowed when the breaker is CLOSED but denied when it's OPEN.  However, this context is operational tempo, not semantic intent.  Agent Gate evaluates `(action, operational_context)` rather than AARM's full `(action, intent_context)`.
 
 ---
 
@@ -78,54 +79,59 @@ Agent Gate's core architecture satisfies R1. The MCP proxy intercepts `tools/cal
 
 ---
 
-#### R2: Context Accumulation ⚠️ Partial
+#### R2: Context Accumulation ⚠️ Partial (Improved)
 
 > *Requirement: Track prior actions, data classifications, and original request in an append-only, tamper-evident log.*
 
-Agent Gate logs all tool calls to a JSONL audit log with timestamps, tool names, arguments, verdicts, tiers, and reasons. However, this falls short of AARM's context accumulation requirements in several ways:
+Agent Gate logs all tool calls to a JSONL audit log with timestamps, tool names, arguments, verdicts, tiers, reasons, and policy hashes.  The rate tracker now maintains session-level operational context that accumulates across tool calls and influences authorization decisions.
 
 | AARM Requirement | Agent Gate Status |
 |---|---|
 | Track prior actions | ✅ Audit log records all tool calls with verdicts |
 | Append-only log | ✅ JSONL file opened in append mode |
-| Hash-chained entries | ❌ Not implemented — entries are not cryptographically linked |
-| Session-level context tracking | ⚠️ `session_id` field exists but context is not accumulated across actions |
+| Hash-chained entries | ✅ SHA-256 hash chaining — each record includes `prev_hash` and `record_hash` |
+| Session-level context tracking | ⚠️ Rate tracker maintains sliding window counters, circuit breaker state, and backoff history per session; `rate_context` snapshot included in audit records for rate-limited decisions |
+| Context available to policy engine | ⚠️ Rate context is computed by the gate and passed to OPA as input; circuit breaker state influences authorization decisions |
 | Original user request | ❌ Not captured — the proxy sees tool calls, not the user's original intent |
 | Data classifications | ❌ No data sensitivity tracking |
-| Context available to policy engine | ❌ Audit log is write-only — not queried during evaluation |
 
 **Implementation evidence:**
-- `audit.py`: `AuditLogger.log()` writes structured records to JSONL, including `session_id` and `server_name`
-- `audit.py`: `AuditRecord` captures `timestamp`, `tool_name`, `arguments`, `verdict`, `tier`, `reason`, `vault_path`, `duration_ms`
-- No mechanism exists to feed accumulated context back into policy evaluation
+- `audit.py`: `AuditRecord` includes `policy_hash` (SHA-256 of governing policy) and `rate_context` (operational state snapshot) fields
+- `audit.py`: SHA-256 hash chaining via `prev_hash` and `record_hash` fields with `verify_chain()` for integrity verification
+- `rate_tracker.py`: `RateTracker` maintains per-tool sliding window counters, per-tier aggregate counters, global counter, and three-state circuit breaker — all accumulated across the session
+- `rate_tracker.py`: `get_rate_context()` returns a snapshot of accumulated state for audit records and OPA input
+- `gate.py`: Circuit breaker state and rate limits directly influence authorization decisions — context feeds back into the policy evaluation pipeline
 
-**Gap:** The audit log is a post-hoc record, not a live context accumulator. AARM requires that accumulated context influences authorization decisions — Agent Gate's audit log is not read during evaluation.
+**Remaining gap:** The accumulated context is operational (call counts, failure rates, timing) rather than semantic (original intent, data sensitivity).  AARM's full R2 envisions context that captures why the user initiated the session and tracks semantic drift from that intent.  Agent Gate's rate context answers "how fast is this agent operating?" but not "is this agent still doing what it was asked to do?"
 
 ---
 
-#### R3: Policy Evaluation with Intent Alignment ⚠️ Partial
+#### R3: Policy Evaluation with Intent Alignment ⚠️ Partial (Improved)
 
 > *Requirement: Evaluate actions against static policy AND contextual intent alignment, supporting forbidden, context-dependent deny, context-dependent allow, and context-dependent defer classifications.*
 
-Agent Gate implements static policy evaluation with two classifier backends (Python and OPA). It does not implement intent alignment or context-dependent classification.
+Agent Gate implements static policy evaluation with two classifier backends (Python and OPA), and now implements a limited form of context-dependent deny through rate limiting and the circuit breaker.  It does not implement intent alignment or context-dependent allow/defer.
 
 | AARM Requirement | Agent Gate Status |
 |---|---|
 | Static policy evaluation | ✅ YAML-defined rules, pattern matching, envelope enforcement |
 | Forbidden classification | ✅ `BLOCKED` tier with hard deny |
-| Context-dependent deny | ❌ Not implemented |
+| Context-dependent deny | ⚠️ Circuit breaker denies otherwise-allowed actions when failure rate exceeds threshold; rate limits deny when operational tempo is exceeded.  Context is operational, not semantic. |
 | Context-dependent allow | ❌ Not implemented |
 | Context-dependent defer | ❌ Not implemented |
 | Intent alignment evaluation | ❌ Not implemented |
 | Pluggable policy language | ✅ Python and OPA/Rego backends |
 
 **Implementation evidence:**
-- `classifier_base.py`: `ClassifierBase.classify()` evaluates tool calls based on command name, argument patterns, and path envelope
-- `classifier.py`: `PythonClassifier._evaluate()` performs static pattern matching
-- `opa_classifier.py`: `OPAClassifier` delegates to Open Policy Agent for policy evaluation
-- `gate.py`: Tier-based routing — no context input to any evaluation path
+- `classifier_base.py`: `ActionTier` enum now includes `RATE_LIMITED` alongside `BLOCKED`, `DESTRUCTIVE`, `NETWORK`, `READ_ONLY`, `UNCLASSIFIED`
+- `gate.py`: `Gate.evaluate()` checks circuit breaker state and rate limits before classification — the same action produces different decisions based on accumulated operational context
+- `rate_tracker.py`: `CircuitBreaker` implements CLOSED → OPEN → HALF_OPEN → CLOSED state machine; `SlidingWindowCounter` tracks per-tool, per-tier, and global call rates
+- `yaml_to_rego.py`: Rate limit thresholds compile to Rego rules, enabling OPA to evaluate `(action, rate_context)` tuples
+- `opa_classifier.py`: OPA receives `rate_context` in input, evaluating rate thresholds alongside static policy
 
-**Note:** AARM explicitly states that implementations may use OPA, Cedar, or custom DSLs as their policy engine, provided the engine can evaluate the tuple `(action, context)`. Agent Gate's OPA integration satisfies the policy engine requirement structurally — the gap is in providing context to that engine.
+**Remaining gap:** The context-dependent decisions are limited to operational tempo (how fast, how often, how many failures).  AARM's full R3 envisions context that includes the session's purpose, accumulated data sensitivity, and semantic drift from original intent.  Agent Gate's circuit breaker is a mechanical safety control, not an intent alignment check.
+
+**Note:** AARM explicitly states that implementations may use OPA, Cedar, or custom DSLs as their policy engine, provided the engine can evaluate the tuple `(action, context)`.  Agent Gate's OPA integration now partially satisfies this: the `yaml_to_rego.py` compiler generates rate limit threshold rules, and the gate passes `rate_context` as part of the OPA input, enabling Rego policies to evaluate `(action, rate_context)`.  The remaining gap is providing full session context (action history, data sensitivity, original intent) to the policy engine.
 
 ---
 
@@ -157,30 +163,32 @@ Agent Gate implements three of AARM's five authorization decisions:
 
 ---
 
-#### R5: Tamper-Evident Receipts ⚠️ Partial
+#### R5: Tamper-Evident Receipts ⚠️ Partial (Improved)
 
 > *Requirement: Cryptographically signed records binding action, context, decision, and outcome.*
 
-Agent Gate has structured logging and SHA-256 integrity verification for vault snapshots, but does not produce AARM-conformant receipts.
+Agent Gate has structured logging with SHA-256 hash chaining for tamper evidence, policy hash binding for configuration traceability, and rate context snapshots on rate-limited decisions.  It does not yet produce fully AARM-conformant signed receipts.
 
 | AARM Requirement | Agent Gate Status |
 |---|---|
 | Structured action records | ✅ JSONL audit records with tool name, arguments, verdict, tier, reason |
 | Decision recorded | ✅ Verdict and reason logged |
-| Context binding | ❌ No session context included in records |
+| Hash-chaining | ✅ SHA-256 `prev_hash` and `record_hash` fields; `verify_chain()` detects tampering |
+| Policy binding | ✅ `policy_hash` (truncated SHA-256) on every record — proves which policy version governed each decision |
+| Context binding | ⚠️ `rate_context` snapshot included on rate-limited decisions; not included on all decisions |
 | Outcome binding | ❌ Action outcome (success/failure of tool execution) not captured |
-| Cryptographic signing | ❌ Records are not signed |
-| Hash-chaining | ❌ Records are not linked to prior entries |
-| Offline verification | ❌ No mechanism to verify receipt integrity independently |
+| Cryptographic signing | ❌ Records are hash-chained but not signed with a key |
+| Offline verification | ⚠️ `verify_chain()` verifies hash chain integrity; no signature verification |
 | Vault snapshot integrity | ✅ SHA-256 hashes computed for all vault backups |
 
 **Implementation evidence:**
-- `audit.py`: `AuditRecord.to_json()` produces structured records but without cryptographic properties
-- `vault.py`: `VaultManager._file_sha256()` computes SHA-256 for backup integrity verification
+- `audit.py`: `AuditRecord` includes `policy_hash`, `rate_context`, `prev_hash`, and `record_hash` fields
+- `audit.py`: `verify_chain()` walks the log and confirms hash chain integrity in a single pass
+- `policy_loader.py`: `Policy.policy_hash` computes deterministic SHA-256 from sorted JSON of the raw policy
+- `gate.py`: Every logged decision includes `policy_hash`; rate-limited decisions additionally include `rate_context`
 - `vault.py`: `VaultSnapshot` dataclass includes `sha256` field for each backed-up file
-- No receipt schema binding `(action, context, decision, outcome)` as a single signed artifact
 
-**Gap:** AARM receipts must enable forensic reconstruction — given a receipt, an auditor should be able to verify what action was proposed, what context existed at decision time, what decision was made and why, and what the outcome was. Agent Gate's audit records capture the decision but not the full binding.
+**Remaining gap:** AARM receipts must bind `(action, context, decision, outcome)` as a single signed artifact.  Agent Gate binds action + decision + policy_hash + partial context, but does not capture the outcome of tool execution (did the action succeed after the gate allowed it?), does not include full session context on every record, and does not sign records with a cryptographic key.  The hash chain provides tamper evidence (modification is detectable) but not non-repudiation (cannot prove who created the record).
 
 ---
 
@@ -219,13 +227,13 @@ This is architecturally consistent with Agent Gate's current design philosophy o
 
 ---
 
-#### R8: Telemetry Export ❌ Not Implemented
+#### R8: Telemetry Export ⚠️ Foundation Laid
 
 > *Requirement: Structured event export to SIEM/SOAR platforms.*
 
-Agent Gate writes JSONL audit logs to local files. There is no export mechanism to external telemetry systems.
+Agent Gate writes JSONL audit logs to local files with structured fields designed for downstream consumption.  There is no export mechanism to external telemetry systems, but the data shape is designed for it.
 
-**Starting point:** The JSONL format is a reasonable foundation. The records include structured fields (timestamp, tool name, verdict, tier) that map to common SIEM event schemas. The gap is in transport (no syslog, no webhook, no OpenTelemetry export) and in schema compliance (no CEF, no OCSF mapping).
+**Starting point:** The JSONL records include structured fields (timestamp, tool name, verdict, tier, policy_hash, rate_context, duration_ms) that map to common SIEM event schemas.  The `rate_context` snapshots include counter values, breaker state, and limit configurations — the kind of operational telemetry that SIEM/SOAR platforms consume for anomaly detection and alerting.  The gap is in transport (no syslog, no webhook, no OpenTelemetry export) and in schema compliance (no CEF, no OCSF mapping).
 
 ---
 
@@ -244,17 +252,17 @@ Agent Gate does not manage credentials. MCP server credentials pass through the 
 | Requirement | Level | Description | Status | Notes |
 |---|---|---|---|---|
 | **R1** | MUST | Pre-execution interception | ✅ Satisfied | Core architecture — MCP proxy intercepts all tool calls |
-| **R2** | MUST | Context accumulation | ⚠️ Partial | Audit log exists; no hash-chaining, no context feedback to policy engine |
-| **R3** | MUST | Policy evaluation with intent alignment | ⚠️ Partial | Static policy evaluation implemented; no context-dependent classification |
+| **R2** | MUST | Context accumulation | ⚠️ Partial (improved) | Hash-chained audit log; rate tracker accumulates session-level operational context; context feeds back to policy engine via circuit breaker and OPA input; no intent tracking |
+| **R3** | MUST | Policy evaluation with intent alignment | ⚠️ Partial (improved) | Static policy + context-dependent deny via circuit breaker and rate limits; no intent alignment |
 | **R4** | MUST | Five authorization decisions | ⚠️ Partial | ALLOW and DENY implemented; ESCALATE ≈ STEP_UP without completion; no MODIFY or DEFER |
-| **R5** | MUST | Tamper-evident receipts | ⚠️ Partial | Structured JSONL logging; SHA-256 on vault snapshots; no signed receipts |
+| **R5** | MUST | Tamper-evident receipts | ⚠️ Partial (improved) | Hash-chained JSONL with policy_hash binding and rate_context snapshots; no cryptographic signing |
 | **R6** | MUST | Identity binding | ❌ Gap | Session UUID only; no human/agent/service/role identity |
 | **R7** | SHOULD | Semantic distance tracking | ❌ Gap | No embedding or drift detection |
-| **R8** | SHOULD | Telemetry export | ❌ Gap | JSONL foundation exists; no SIEM/SOAR transport |
+| **R8** | SHOULD | Telemetry export | ⚠️ Foundation laid | Structured JSONL with OpenTelemetry-ready fields; no SIEM/SOAR transport |
 | **R9** | SHOULD | Least privilege / JIT credentials | ❌ Gap | Aligns with planned JIT authority grants feature |
 
-**AARM Core (R1–R6):** 1 of 6 fully satisfied. 4 of 6 partially satisfied. 1 gap.
-**AARM Extended (R7–R9):** 0 of 3 satisfied.
+**AARM Core (R1–R6):** 1 of 6 fully satisfied.  4 of 6 partially satisfied (3 improved since v0.1.0).  1 gap.
+**AARM Extended (R7–R9):** 0 of 3 fully satisfied.  1 foundation laid.
 
 ---
 
@@ -262,21 +270,22 @@ Agent Gate does not manage credentials. MCP server credentials pass through the 
 
 The following outlines what Agent Gate would need to reach AARM Core (R1–R6) conformance. Items are ordered by implementation dependency, not priority.
 
-### 1. Context Accumulator (R2)
+### 1. Context Accumulator (R2) — In Progress
 
-Build a session-scoped context store that tracks:
-- Original user request (if available from the protocol)
-- Ordered list of prior tool calls and their verdicts
-- Data classifications of accessed resources
-- Hash-chain linking each entry to its predecessor
+Agent Gate now maintains session-level operational context via the rate tracker (sliding window counters, circuit breaker state, backoff history) and records this context in audit logs.  Remaining work:
 
-Make this context available as input to the policy engine at evaluation time.
+- Capture the original user request (if available from the MCP protocol or client metadata)
+- Track data classifications of accessed resources
+- Extend `rate_context` to include a summary of prior actions (not just counts, but the sequence of tool calls and verdicts)
+- Make the full accumulated context available to the OPA policy engine (currently only rate_context is passed)
 
-### 2. Context-Dependent Classification (R3)
+### 2. Context-Dependent Classification (R3) — In Progress
 
-Extend the classifier interface to accept accumulated context alongside the tool call. This enables policies that reference prior actions — for example, denying file exfiltration after sensitive data was read in the same session, even though the exfiltration action would be permitted in isolation.
+Agent Gate now implements context-dependent deny through the circuit breaker (operational context influences authorization).  Remaining work:
 
-The OPA backend is well-positioned for this: Rego policies can evaluate the `(action, context)` tuple natively once context is provided as input.
+- Extend context-dependent decisions beyond operational tempo to include session history — for example, denying file exfiltration after sensitive data was read in the same session, even though the exfiltration action would be permitted in isolation
+- The OPA backend is well-positioned for this: Rego policies can evaluate the `(action, context)` tuple natively once full session context is provided as input alongside rate_context
+- Implement context-dependent allow — actions denied by default that are permitted when context confirms legitimate intent
 
 ### 3. MODIFY and DEFER Decisions (R4)
 
@@ -286,9 +295,13 @@ The OPA backend is well-positioned for this: Rego policies can evaluate the `(ac
 
 **STEP_UP completion** requires an approval service — a mechanism (webhook, Slack integration, CLI prompt) to collect human approval and resume a held action.
 
-### 4. Signed Receipts (R5)
+### 4. Signed Receipts (R5) — In Progress
 
-Extend audit records to bind `(action, context_snapshot, decision, outcome)` as a single artifact. Sign receipts with a process-local key (minimum) or an HSM/KMS-backed key (production). Implement hash-chaining so each receipt references its predecessor.
+Agent Gate now has hash-chained audit records with policy hash binding and partial context (rate_context on rate-limited decisions).  Remaining work:
+
+- Extend records to bind outcome (success/failure of tool execution after the gate allowed it)
+- Include full session context snapshot on every record, not just rate-limited decisions
+- Sign receipts with a process-local key (minimum) or an HSM/KMS-backed key (production) — hash chaining provides tamper detection but not non-repudiation
 
 ### 5. Identity Binding (R6)
 
@@ -310,11 +323,30 @@ Beyond the conformance requirements, Agent Gate and AARM share foundational prin
 | Prevention over detection | Actions must be blocked before execution, not just logged | Core design — the gate makes the wrong action unreachable |
 | Structured action inspection | Evaluate the action, not the reasoning | Pre-computed classification against tool call structure |
 | The interception point exists | All agents output structured tool calls that client code executes | MCP proxy sits in the native gap between model output and tool execution |
-| Feedback on denial | Authorization decisions include reasons and remediation paths | `GateDecision` includes `denial_feedback` and `escalation_hint` |
-| Policy-as-code | Declarative policy definitions | YAML policies with OPA/Rego backend option |
+| Feedback on denial | Authorization decisions include reasons and remediation paths | `GateDecision` includes `denial_feedback`, `escalation_hint`, and `rate_status` with remaining budget and reset timing |
+| Policy-as-code | Declarative policy definitions | YAML policies with OPA/Rego backend option; rate limits and circuit breaker thresholds defined at design time |
+| Context-dependent decisions | Actions evaluated against accumulated session state | Circuit breaker and rate limiter make decisions based on accumulated operational context (tempo, not yet intent) |
+| Configuration traceability | — | `policy_hash` on every audit record proves which policy version governed each decision |
 | Agent-unreachable recovery | — | Vault-backed rollback ensures destructive actions are recoverable |
 
 Agent Gate's vault-backed rollback pattern is not addressed by AARM but represents a complementary capability: ensuring that even when a destructive action is authorized and executed, recovery remains possible through agent-unreachable backup storage.
+
+---
+
+## Changelog
+
+### v0.2.0 (2026-02-23) — Rate Limiting & Circuit Breaker
+
+Phase 5 implementation (rate limiting, circuit breaker, policy hash traceability) advanced alignment on four AARM requirements:
+
+- **R2 (Context Accumulation):** Rate tracker now maintains session-level operational context (sliding window counters, circuit breaker state, backoff history) that accumulates across tool calls.  `rate_context` snapshots in audit records.  Hash-chaining implemented with `prev_hash`/`record_hash` and `verify_chain()`.  Context feeds back to policy engine via circuit breaker decisions and OPA input.
+- **R3 (Policy Evaluation):** Circuit breaker implements context-dependent deny — the same action produces different authorization decisions based on accumulated operational state.  `RATE_LIMITED` tier added to classification model.  OPA receives `rate_context` in input for threshold evaluation.
+- **R5 (Tamper-Evident Receipts):** `policy_hash` on every audit record creates cryptographic binding between each decision and its governing policy version.  `rate_context` on rate-limited decisions provides partial context binding.  Hash-chaining provides tamper evidence.
+- **R8 (Telemetry Export):** Audit records now include structured operational telemetry fields (`rate_context`, `policy_hash`, `duration_ms`) designed for downstream SIEM/SOAR consumption.  Moved from "not implemented" to "foundation laid."
+
+### v0.1.0 (2026-02-19) — Initial Assessment
+
+Baseline gap analysis against AARM v0.1.  R1 satisfied; R2-R5 partial; R6 gap; R7-R9 not implemented.
 
 ---
 

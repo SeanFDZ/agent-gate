@@ -146,3 +146,110 @@ logging:
   log_allowed: true
   log_denied: true
   log_vault_operations: true
+
+# --- RATE LIMITS & CIRCUIT BREAKER ---
+# Optional.  If omitted, no rate limiting is applied.
+rate_limits:
+  # Algorithm: "sliding_window" (default) or "token_bucket"
+  algorithm: "sliding_window"
+
+  # Per-tool limits (tool name matches the "command" field in actions)
+  tools:
+    # Read-only tools: generous limits
+    cat:
+      max_calls: 120
+      window_seconds: 60
+    ls:
+      max_calls: 120
+      window_seconds: 60
+    grep:
+      max_calls: 120
+      window_seconds: 60
+    read_file:
+      max_calls: 120
+      window_seconds: 60
+
+    # Destructive tools: moderate limits
+    write_file:
+      max_calls: 30
+      window_seconds: 60
+      on_exceed: "escalate"
+    mv:
+      max_calls: 20
+      window_seconds: 60
+      on_exceed: "escalate"
+    cp:
+      max_calls: 30
+      window_seconds: 60
+      on_exceed: "escalate"
+
+    # High-risk destructive: strict limits
+    rm:
+      max_calls: 10
+      window_seconds: 60
+      on_exceed: "deny"
+      message: "rm rate limit exceeded.  Max 10 calls per 60s."
+    chmod:
+      max_calls: 5
+      window_seconds: 60
+      on_exceed: "deny"
+    chown:
+      max_calls: 5
+      window_seconds: 60
+      on_exceed: "deny"
+
+    # Network tools: strict
+    curl:
+      max_calls: 10
+      window_seconds: 60
+      on_exceed: "escalate"
+    wget:
+      max_calls: 10
+      window_seconds: 60
+      on_exceed: "escalate"
+
+  # Per-tier defaults (applied when no tool-specific limit exists)
+  tier_defaults:
+    read_only:
+      max_calls: 120
+      window_seconds: 60
+      on_exceed: "deny"
+    destructive:
+      max_calls: 30
+      window_seconds: 60
+      on_exceed: "escalate"
+    network:
+      max_calls: 10
+      window_seconds: 60
+      on_exceed: "escalate"
+    unclassified:
+      max_calls: 10
+      window_seconds: 60
+      on_exceed: "deny"
+
+  # Global limit (all tools combined)
+  global:
+    max_calls: 200
+    window_seconds: 60
+    on_exceed: "read_only"
+    message: "Global rate limit exceeded.  Agent restricted to read-only."
+
+  # Circuit breaker (derivative metric thresholds)
+  circuit_breaker:
+    enabled: true
+    sliding_window_size: 20
+    minimum_calls: 10
+    failure_rate_threshold: 0.50
+    slow_call_rate_threshold: 0.50
+    slow_call_duration_seconds: 5.0
+    wait_duration_open_seconds: 30
+    permitted_calls_half_open: 3
+    on_trip: "read_only"
+    message: "Circuit breaker tripped.  Agent restricted to read-only."
+
+  # Exponential backoff on repeated rate limit violations
+  backoff:
+    enabled: true
+    initial_wait_seconds: 5
+    multiplier: 2.0
+    max_wait_seconds: 300

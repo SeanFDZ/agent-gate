@@ -52,6 +52,8 @@ class AuditRecord:
     msg_id: Optional[Any] = None      # JSON-RPC message id
     vault_path: Optional[str] = None  # Path to vault backup, if any
     duration_ms: Optional[float] = None  # Gate evaluation time
+    policy_hash: Optional[str] = None     # SHA-256 hash (truncated) of governing policy
+    rate_context: Optional[dict] = None   # Rate tracking state at time of decision
     prev_hash: Optional[str] = None   # SHA-256 hash of previous record (chain link)
     record_hash: Optional[str] = None  # SHA-256 hash of this record's content
 
@@ -198,6 +200,8 @@ class AuditLogger:
         msg_id: Optional[Any] = None,
         vault_path: Optional[str] = None,
         duration_ms: Optional[float] = None,
+        policy_hash: Optional[str] = None,
+        rate_context: Optional[dict] = None,
     ) -> None:
         """
         Convenience method to log a tool call with common fields.
@@ -215,6 +219,8 @@ class AuditLogger:
             msg_id=msg_id,
             vault_path=vault_path,
             duration_ms=duration_ms,
+            policy_hash=policy_hash,
+            rate_context=rate_context,
         )
         self.log(record)
 

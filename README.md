@@ -2,9 +2,9 @@
 
 **Execution authority layer for AI agents - vault-backed rollback and policy enforcement.**
 
-Agent Gate sits between an AI agent's proposed tool calls and their execution. It inspects every action as structured data, classifies it against pre-computed policy, enforces directory boundaries, and automatically backs up targets to an agent-unreachable vault before any destructive operation proceeds.
+Agent Gate sits between an AI agent's proposed tool calls and their execution.  It inspects every action as structured data, classifies it against pre-computed policy, enforces directory boundaries, controls operational tempo, and automatically backs up targets to an agent-unreachable vault before any destructive operation proceeds.
 
-The agent runs at full autonomy and full speed. The gate silently ensures every destructive action is reversible and every action stays within the authorized envelope.
+The agent runs at full autonomy and full speed.  The gate silently ensures every destructive action is reversible, every action stays within the authorized envelope, and no runaway loop overwhelms the systems the agent operates on.
 
 ## The Problem
 
@@ -35,30 +35,35 @@ Agent proposes: rm important.txt
    │  AGENT GATE │
    ├─────────────┤
    │ 1. Literal? │  ← reject shell expansion ($VAR, $(cmd), globs)
-   │ 2. Classify │  ← "rm" = destructive action
-   │ 3. Envelope │  ← is resolved path authorized? (follows symlinks)
-   │ 4. Vault    │  ← copy important.txt to vault
-   │ 5. Allow    │  ← backup confirmed, proceed
+   │ 2. Tempo?   │  ← circuit breaker open? rate limit exceeded?
+   │ 3. Classify │  ← "rm" = destructive action
+   │ 4. Envelope │  ← is resolved path authorized? (follows symlinks)
+   │ 5. Vault    │  ← copy important.txt to vault
+   │ 6. Allow    │  ← backup confirmed, proceed
    └─────────────┘
          │
          ▼
    rm important.txt executes
 ```
 
-If the command contains shell expansion syntax, it's rejected before classification — the gate can't trust extracted paths when the shell would transform the command. The agent is told to rewrite using literal values.
+If the command contains shell expansion syntax, it's rejected before classification — the gate can't trust extracted paths when the shell would transform the command.  The agent is told to rewrite using literal values.
 
-If the backup fails, the destructive action is blocked. No snapshot, no destruction.
+If rate limits are exceeded or the circuit breaker has tripped, the action is denied before classification even runs — the gate stops runaway loops at the earliest possible point.
+
+If the backup fails, the destructive action is blocked.  No snapshot, no destruction.
 
 The vault lives outside the agent's permitted directory envelope. The same gate that enforces the envelope protects the vault. The agent cannot reach, modify, or delete the backups.
 
 ## Design Principles
 
-1. **Prevention over auditability.** Audit trails are necessary but not sufficient. The architecture makes damage reversible, not just logged.
-2. **Pre-computed classification, not runtime evaluation.** Risk tiers and rules are defined at design time. The runtime check is a lookup, not an LLM call.
-3. **Inspect the action, not the reasoning.** We don't need to understand why an agent wants to delete a file. We see "rm" targeting a path and match it against policy.
-4. **Literal-only enforcement.** The gate defines what "clean" looks like — literal paths, flags, and simple values — and rejects anything else. Shell expansion syntax (`$VAR`, `$(cmd)`, globs, backticks) is denied before classification because the gate can't trust paths it can't read. This is an allowlist on arguments, not a blocklist on shell tricks.
-5. **Tiered response.** Auto-allow safe actions, vault-backup destructive ones, escalate network access, hard-stop prohibited ones.
-6. **Structured denial feedback.** The gate doesn't just say "no." It returns why and what would be required to proceed.
+1. **Prevention over auditability.**  Audit trails are necessary but not sufficient.  The architecture makes damage reversible, not just logged.
+2. **Pre-computed classification, not runtime evaluation.**  Risk tiers and rules are defined at design time.  The runtime check is a lookup, not an LLM call.
+3. **Inspect the action, not the reasoning.**  We don't need to understand why an agent wants to delete a file.  We see "rm" targeting a path and match it against policy.
+4. **Literal-only enforcement.**  The gate defines what "clean" looks like, literal paths, flags, and simple values, and rejects anything else.  Shell expansion syntax (`$VAR`, `$(cmd)`, globs, backticks) is denied before classification because the gate can't trust paths it can't read.  This is an allowlist on arguments, not a blocklist on shell tricks.
+5. **Operational envelope, not just authority envelope.**  Authorization answers "can this agent do this?"  Rate limiting answers "can this agent do this *right now*, given operational context?"  An agent operating within its authority can still cause a production incident by executing allowed operations too rapidly.
+6. **Tiered response.**  Auto-allow safe actions, vault-backup destructive ones, escalate network access, hard-stop prohibited ones.
+7. **Structured denial feedback.**  The gate doesn't just say "no."  It returns why, what would be required to proceed, and how much budget remains.
+8. **Policy traceability.**  Every audit record includes a cryptographic hash of the governing policy, proving which exact policy version made each decision.
 
 ## Tiered Classification
 
@@ -69,6 +74,72 @@ The vault lives outside the agent's permitted directory envelope. The same gate 
 | **Network** | `curl`, `wget`, `ssh`, `scp` | Escalate for human approval (configurable) |
 | **Blocked** | `rm -rf /`, `curl \| bash`, `mkfs` | Hard deny with feedback |
 | **Unclassified** | Anything not in policy | Default deny, request human review |
+| **Rate-limited** | Any tool exceeding tempo limits | Deny with remaining budget, reset timing, and recovery path |
+
+## Rate Limiting & Circuit Breaker
+
+Agent Gate treats agents as distributed systems that need operational tempo controls, not just action authorization.  An agent operating entirely within its authority envelope can still cause a production incident by executing allowed operations too rapidly, such as a tight loop of file deletions that overwhelms a filesystem or a burst of API calls that triggers upstream throttling.
+
+Rate limiting is fully optional.  If the `rate_limits` section is absent from the policy YAML, all rate checking is skipped and the gate behaves exactly as before.
+
+### Three Layers of Rate Control
+
+**Per-tool limits** — each tool has its own sliding window counter.  `rm` at 10/minute is independent from `cat` at 120/minute.
+
+**Per-tier defaults** — aggregate limits across all tools in a classification tier.  If no tool-specific limit exists, the tier default applies.  This catches novel tools that aren't individually configured.
+
+**Global limit** — all tool calls combined.  A hard ceiling on total operational tempo regardless of which tools are being used.
+
+```yaml
+rate_limits:
+  tools:
+    rm:
+      max_calls: 10
+      window_seconds: 60
+      on_exceed: "deny"
+    cat:
+      max_calls: 120
+      window_seconds: 60
+
+  tier_defaults:
+    read_only:  { max_calls: 120, window_seconds: 60 }
+    destructive: { max_calls: 30, window_seconds: 60, on_exceed: "escalate" }
+
+  global:
+    max_calls: 200
+    window_seconds: 60
+    on_exceed: "read_only"
+```
+
+### Circuit Breaker
+
+A three-state circuit breaker (CLOSED → OPEN → HALF_OPEN → CLOSED) monitors derivative metrics across all tool calls.  If the failure rate exceeds the configured threshold, the breaker trips and restricts the agent to read-only operations until automatic recovery probes succeed.
+
+```
+CLOSED:    Normal operation.  Track outcomes.
+OPEN:      Failure rate exceeded threshold.  Non-read actions denied.
+HALF_OPEN: After wait duration, allow limited probe calls.
+           Success → CLOSED.  Failure → back to OPEN.
+```
+
+The HALF_OPEN state provides automatic recovery without human intervention, following the same pattern used by Resilience4j, Hystrix, and every production circuit breaker implementation.
+
+### Agent Feedback on Rate Denial
+
+When a rate limit is exceeded, the agent receives actionable information to self-regulate:
+
+```
+ACTION DENIED: rm rate limit exceeded.  Max 10 calls per 60s.
+DETAILS: 11 calls in the last 60 seconds (limit: 10).
+RATE STATUS: tool_remaining=0, global_remaining=113, breaker=closed
+TO PROCEED: Wait 12 seconds for the window to clear, or reduce operation frequency.
+```
+
+This follows the same principle as API rate limit headers (X-RateLimit-Remaining, X-RateLimit-Reset), giving the agent enough context to adjust its behavior without human intervention.
+
+### Exponential Backoff
+
+Repeated rate limit violations trigger exponential backoff (5s → 10s → 20s → 40s, capped at 5 minutes).  This prevents tight retry loops from becoming a denial-of-service vector against the systems the agent operates on.  A successful call within limits resets the backoff multiplier.
 
 ## Policy Backends
 
@@ -126,7 +197,7 @@ Best for: enterprise deployments, teams needing RBAC/policy composition, organiz
 brew install opa  # macOS
 # or: curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static && chmod +x opa
 
-# Run Rego policy tests (24/24 passing)
+# Run Rego policy tests (includes rate limit threshold tests)
 opa test ./rego/ -v
 ```
 
@@ -268,10 +339,12 @@ The agent sees the denial reason and can adjust its approach — exactly like a 
 
 ### Structured Audit Log
 
-Every tool call through the proxy is logged to a JSONL audit file with SHA-256 hash chaining for tamper evidence. Each record includes a `prev_hash` linking to the prior record and a `record_hash` of its own content, creating a cryptographic chain from a deterministic genesis value. Any modification, insertion, or deletion of a historical record breaks the chain from that point forward.
+Every tool call through the proxy is logged to a JSONL audit file with SHA-256 hash chaining for tamper evidence.  Each record includes a `prev_hash` linking to the prior record and a `record_hash` of its own content, creating a cryptographic chain from a deterministic genesis value.  Any modification, insertion, or deletion of a historical record breaks the chain from that point forward.
+
+Each record also includes a `policy_hash`, a truncated SHA-256 hash of the governing policy bundle.  This proves which exact policy version made each decision, so modifying the policy after the fact cannot disguise the original authorization logic.  Rate-limited decisions additionally include a `rate_context` snapshot capturing the rate tracking state at the moment of decision.
 
 ```json
-{"timestamp":"2026-02-19T15:30:00Z","tool_name":"read_file","arguments":{"path":"/tmp/test.txt"},"verdict":"allow","tier":"read_only","reason":"Read-only action","duration_ms":0.8,"server_name":"filesystem","session_id":"5ee3c363","prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","record_hash":"a1b2c3..."}
+{"timestamp":"2026-02-23T15:30:00Z","tool_name":"rm","arguments":{"command":"rm temp.log"},"verdict":"deny","tier":"rate_limited","reason":"rm rate limit exceeded.  Max 10 calls per 60s.","policy_hash":"a3f7b2c9e1d045f8","rate_context":{"tool_counts":{"rm":{"count":11,"limit":10}},"global_count":{"count":87,"limit":200},"breaker_state":"closed"},"prev_hash":"b4c8...","record_hash":"d9e2..."}
 ```
 
 A `verify_chain()` function walks the log and confirms integrity in a single pass — any tampered or deleted record is detected immediately.
@@ -338,11 +411,12 @@ Recovery is a copy: `cp vault/<timestamp>/path/to/file workspace/path/to/file`
 
 ### Known Limitations - Honest Assessment
 
-This is a safety net for well-intentioned agents making mistakes. It is not a security boundary against adversarial agents.
+This is a safety net for well-intentioned agents making mistakes.  It is not a security boundary against adversarial agents.
 
-- **Application-layer gating, not OS-level sandboxing.** Agent Gate operates at the tool call level — it inspects what the agent asks to do, not what programs do internally once executed. If your policy allows `python3` (or any interpreter) and the script contains `os.remove()`, the gate sees a literal command and allows it. The default policy classifies unknown commands (including `python3`) as unclassified and denies them — so this is a policy choice, not a gate bypass. Full internal-execution coverage requires OS-level sandboxing (containers, seccomp, AppArmor), which is complementary to Agent Gate, not replaced by it.
-- **Path extraction** treats all non-flag arguments as potential paths — conservative but naive. This errs on the side of safety (more things are checked against the envelope than necessary) but may produce false positives for commands with non-path arguments.
-- **Vault backup is not yet wired for MCP tool calls.** The MCP proxy classifies tool calls and enforces envelope boundaries, but the vault's pre-destruction backup currently operates on bash commands and file write paths. An MCP `delete_file` call will be correctly classified as destructive and denied or escalated by policy — but it won't trigger an automatic vault snapshot the way `rm` does through the Claude Code hook. Extending vault coverage to MCP tool arguments is a Phase 5 item.
+- **Application-layer gating, not OS-level sandboxing.**  Agent Gate operates at the tool call level — it inspects what the agent asks to do, not what programs do internally once executed.  If your policy allows `python3` (or any interpreter) and the script contains `os.remove()`, the gate sees a literal command and allows it.  The default policy classifies unknown commands (including `python3`) as unclassified and denies them — so this is a policy choice, not a gate bypass.  Full internal-execution coverage requires OS-level sandboxing (containers, seccomp, AppArmor), which is complementary to Agent Gate, not replaced by it.
+- **Path extraction** treats all non-flag arguments as potential paths — conservative but naive.  This errs on the side of safety (more things are checked against the envelope than necessary) but may produce false positives for commands with non-path arguments.
+- **Rate limiting state is in-memory.**  Counters and circuit breaker state reset when the gate process restarts.  This is acceptable for single-agent sessions but means rate limits don't persist across restarts.  For long-running multi-agent deployments, a shared state backend (Redis, etc.) would be needed.
+- **Vault backup is not yet wired for MCP tool calls.**  The MCP proxy classifies tool calls and enforces envelope boundaries, but the vault's pre-destruction backup currently operates on bash commands and file write paths.  An MCP `delete_file` call will be correctly classified as destructive and denied or escalated by policy — but it won't trigger an automatic vault snapshot the way `rm` does through the Claude Code hook.  Extending vault coverage to MCP tool arguments is a future item.
 
 ## Quick Start
 ```bash
@@ -351,12 +425,8 @@ cd agent-gate
 pip3 install pyyaml
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
-# Run all test suites (170/170 Python tests)
-python3 -m tests.test_gate              # Core gate tests (48)
-python3 -m pytest tests/test_mcp_jsonrpc.py   # JSON-RPC parser (52)
-python3 -m pytest tests/test_proxy_config.py  # Config loader (31)
-python3 -m pytest tests/test_audit.py         # Audit logger (21)
-python3 -m pytest tests/test_mcp_proxy.py     # MCP proxy unit (18)
+# Run all test suites (220+ Python tests)
+python3 -m pytest tests/ -v
 
 # Run OPA policy tests (24/24 Rego tests, requires opa binary)
 opa test ./rego/ -v
@@ -375,7 +445,7 @@ python3 -m agent_gate.cli diff <vault_path>
 
 ### YAML (Python backend)
 
-Policies are declarative YAML. Define once at design time, enforce at runtime:
+Policies are declarative YAML.  Define once at design time, enforce at runtime:
 ```yaml
 envelope:
   allowed_paths:
@@ -399,6 +469,19 @@ actions:
     patterns:
       - command: "rm"
         args_contain: ["-rf /"]
+
+# Optional — omit entirely to disable rate limiting
+rate_limits:
+  tools:
+    rm:  { max_calls: 10, window_seconds: 60, on_exceed: "deny" }
+    cat: { max_calls: 120, window_seconds: 60 }
+  tier_defaults:
+    destructive: { max_calls: 30, window_seconds: 60, on_exceed: "escalate" }
+  global: { max_calls: 200, window_seconds: 60, on_exceed: "read_only" }
+  circuit_breaker:
+    enabled: true
+    failure_rate_threshold: 0.50
+    wait_duration_open_seconds: 30
 ```
 
 See [policies/default.yaml](policies/default.yaml) for the full default policy.
@@ -428,15 +511,16 @@ blocked_patterns := {
 }
 ```
 
-See [rego/agent_gate.rego](rego/agent_gate.rego) for the full Rego policy. Run `opa test ./rego/ -v` to execute the policy unit tests.
+See [rego/agent_gate.rego](rego/agent_gate.rego) for the full Rego policy.  The YAML-to-Rego compiler (`yaml_to_rego.py`) generates equivalent Rego from your YAML policy, including rate limit threshold rules when `rate_limits` is configured.  Run `opa test ./rego/ -v` to execute the policy unit tests.
 
 ## The Nuclear C2 Analogy
 
-This architecture is inspired by Permissive Action Links (PALs) in nuclear command and control. PALs don't evaluate whether a launch is wise — they verify that correct authority codes are present. Agent Gate follows the same principle:
+This architecture is inspired by Permissive Action Links (PALs) in nuclear command and control.  PALs don't evaluate whether a launch is wise — they verify that correct authority codes are present.  Agent Gate follows the same principle:
 
-- **Don't evaluate the agent's reasoning. Verify the action's authorization.**
-- **The gate must not prevent authorized actions.** A gate that's too restrictive is as dangerous as one that's too permissive.
-- **The backup vault is like the safing mechanism.** It doesn't prevent the action — it ensures the action is reversible.
+- **Don't evaluate the agent's reasoning.  Verify the action's authorization.**
+- **The gate must not prevent authorized actions.**  A gate that's too restrictive is as dangerous as one that's too permissive.
+- **The backup vault is like the safing mechanism.**  It doesn't prevent the action — it ensures the action is reversible.
+- **Nuclear launch sequences have timing constraints and sequencing requirements separate from authorization codes.**  Rate limiting and circuit breakers enforce the operational envelope, the same way launch procedures enforce cadence independently of authority.
 
 ## Architecture
 ```
@@ -446,15 +530,17 @@ agent_gate/
 ├── classifier.py        # Python backend — YAML policies, pure Python eval
 ├── opa_classifier.py    # OPA backend — Rego policies via subprocess or HTTP
 ├── vault.py             # Vault manager — backup before destruction
-├── policy_loader.py     # YAML policy parser and validator
+├── policy_loader.py     # YAML policy parser, validator, and policy hash
+├── rate_tracker.py      # Sliding window counters, circuit breaker, backoff
 ├── cli.py               # Human-facing rollback interface
 ├── mcp_proxy.py         # MCP proxy — transparent stdio interception layer
 ├── mcp_jsonrpc.py       # JSON-RPC 2.0 parser for MCP protocol messages
 ├── proxy_config.py      # Proxy configuration loader (env/file/defaults)
-└── audit.py             # Structured JSONL audit logger with SHA-256 hash chaining
+├── audit.py             # Structured JSONL audit logger with hash chaining and policy hash
+└── yaml_to_rego.py      # YAML-to-Rego compiler (including rate limit rules)
 rego/
 ├── agent_gate.rego      # OPA policy (equivalent to default.yaml)
-└── agent_gate_test.rego # Formal policy unit tests (24/24 passing)
+└── agent_gate_test.rego # Formal policy unit tests
 integrations/
 └── claude_code/         # Claude Code PreToolUse hook integration
     ├── agent_gate_hook.py       # Bash tool hook
@@ -462,40 +548,52 @@ integrations/
     ├── settings_example.json    # Hook configuration
     └── test_setup.sh            # Test environment setup
 tests/
-├── test_gate.py             # Core gate tests (48/48)
-├── test_mcp_jsonrpc.py      # JSON-RPC parser tests (52/52)
-├── test_proxy_config.py     # Config loader tests (31/31)
-├── test_audit.py            # Audit logger tests (21/21)
-├── test_mcp_proxy.py        # MCP proxy unit tests (18/18)
-└── test_integration_mcp.py  # Live integration tests (12/12)
+├── test_gate.py                # Core gate tests
+├── test_gate_rates.py          # Rate limiting integration tests
+├── test_gate_feedback.py       # Rate-limited agent feedback tests
+├── test_rate_tracker.py        # Sliding window counter and circuit breaker tests
+├── test_policy_loader_rates.py # Rate limits schema validation tests
+├── test_audit.py               # Audit logger tests
+├── test_audit_hash.py          # Policy hash and rate context audit tests
+├── test_mcp_jsonrpc.py         # JSON-RPC parser tests
+├── test_proxy_config.py        # Config loader tests
+├── test_mcp_proxy.py           # MCP proxy unit tests
+└── test_integration_mcp.py     # Live integration tests
 ```
 
-### Classifier Architecture
-
-The classifier uses a template method pattern with pluggable backends:
+### Gate Evaluation Pipeline
 
 ```
-Tool Call → ClassifierBase (shared pre-processing)
+Tool Call → Rate Check (O(1) counter lookup)
               │
-              ├── Parse command + args
-              ├── Shell expansion detection (block non-literal)
-              ├── Path extraction (resolve symlinks)
+              ├── Circuit breaker OPEN? → DENY
+              ├── Tool rate exceeded? → DENY/ESCALATE
+              ├── Global rate exceeded? → DENY/ESCALATE
               │
-              └── _evaluate() → backend-specific
+              └── ClassifierBase (shared pre-processing)
                     │
-                    ├── PythonClassifier: YAML patterns, fnmatch envelope
-                    └── OPAClassifier: Rego evaluation via subprocess/HTTP
+                    ├── Parse command + args
+                    ├── Shell expansion detection (block non-literal)
+                    ├── Path extraction (resolve symlinks)
+                    │
+                    ├── Tier rate check (post-classification)
+                    │
+                    └── _evaluate() → backend-specific
+                          │
+                          ├── PythonClassifier: YAML patterns, fnmatch envelope
+                          └── OPAClassifier: Rego evaluation via subprocess/HTTP
 ```
 
-Pre-processing is structural and backend-independent. Envelope checking and tier matching are policy decisions — this is what the backend implements.
+Rate checks happen before classification because they're O(1) counter comparisons, not policy evaluation.  A rate-tripped agent is stopped at the earliest possible point.  Pre-processing is structural and backend-independent.  Envelope checking and tier matching are policy decisions — this is what the backend implements.
 
 ## Roadmap
 
-- **Phase 1** ✅ — Core gate with simulated tool calls (48/48 tests passing)
+- **Phase 1** ✅ — Core gate with simulated tool calls
 - **Phase 2** ✅ — Claude Code integration via PreToolUse hooks (live tested)
 - **Phase 2.5** ✅ — Hardening: symlink resolution, network tier, literal-only enforcement, policy conditions
-- **Phase 3** ✅ — MCP proxy (transparent stdio proxy intercepting `tools/call`, 12/12 integration tests with filesystem MCP server)
-- **Phase 4** ✅ — OPA/Rego policy engine (dual-backend classifier, 24/24 Rego tests)
+- **Phase 3** ✅ — MCP proxy (transparent stdio proxy intercepting `tools/call`, live integration tests with filesystem MCP server)
+- **Phase 4** ✅ — OPA/Rego policy engine (dual-backend classifier, formal Rego policy tests)
+- **Phase 5** ✅ — Rate limiting & circuit breaker (sliding window counters, three-state circuit breaker, per-tool/per-tier/global limits, exponential backoff, policy hash traceability in audit records, Rego compiler support)
 
 ## The Gap This Fills
 
@@ -505,9 +603,9 @@ Pre-processing is structural and backend-independent. Envelope checking and tier
 | Agent orchestration platforms | Airia, Astrix ACP | Fleet management, routing, cost optimization, governance dashboards | Pre-execution authority on individual tool calls |
 | Agent sandboxes | nono, cco, Claude sandbox | Directory scoping | Pre-backup on destruction |
 | Checkpoint tools | ccundo, git stash | Rollback after the fact | Agent can delete its own backups |
-| **Agent Gate** | — | **Pre-execution authority + vault backup + agent-unreachable recovery + policy-as-code (YAML or OPA/Rego)** | — |
+| **Agent Gate** | — | **Pre-execution authority + vault backup + rate limiting + circuit breaker + agent-unreachable recovery + policy-as-code (YAML or OPA/Rego) + policy-hash audit traceability** | — |
 
-**Why not just use Airia or Guardrails AI?** They solve different problems. Guardrails AI validates what an LLM *outputs* (content safety, PII filtering, hallucination detection) — it assumes the agent is already authorized to act. Airia is an enterprise orchestration platform — it manages which agents run, routes requests between models, and provides governance dashboards. Neither inspects individual tool calls against risk tiers before execution, and neither provides vault-backed rollback that the agent can't reach. Agent Gate is the enforcement layer that sits inside the execution pipeline, not above it.
+**Why not just use Airia or Guardrails AI?**  They solve different problems.  Guardrails AI validates what an LLM *outputs* (content safety, PII filtering, hallucination detection) — it assumes the agent is already authorized to act.  Airia is an enterprise orchestration platform — it manages which agents run, routes requests between models, and provides governance dashboards.  Neither inspects individual tool calls against risk tiers before execution, neither provides vault-backed rollback that the agent can't reach, and neither enforces operational tempo limits to prevent runaway loops.  Agent Gate is the enforcement layer that sits inside the execution pipeline, not above it.
 
 ## License
 
@@ -519,4 +617,9 @@ Sean Lavigne — [GitHub](https://github.com/SeanFDZ)
 
 ---
 
-Agent Gate's enforcement pattern maps to NIST SP 800-53 AC-3 (Access Enforcement), AU-9 (Protection of Audit Information), AU-10 (Non-repudiation), CP-9 (System Backup), and NIST AI RMF MG-2.4 (Contain AI System Impact).
+Agent Gate's enforcement pattern maps to NIST SP 800-53 AC-3 (Access Enforcement),
+AU-9 (Protection of Audit Information), AU-10 (Non-repudiation), CM-3
+(Configuration Change Control), CP-9 (System Backup), SC-5 (Denial-of-Service
+Protection), SI-4 (System Monitoring), SI-17 (Fail-Safe Procedures), and NIST AI
+RMF MG-2.4 (Contain AI System Impact), GOVERN 1.7 (Operational Risk Management),
+and MEASURE 2.6 (Performance Monitoring).

@@ -108,8 +108,11 @@ gate_behavior:
         server_name="test-server",
     )
 
-    # Replace gate with mock
+    # Replace gate with mock.  Set policy_hash and rate_tracker
+    # so audit logging can serialize them to JSON.
     proxy.gate = gate_mock
+    gate_mock.policy.policy_hash = "mockpolicyhash1234"
+    gate_mock.rate_tracker.get_rate_context.return_value = {}
     proxy.audit = AuditLogger(
         os.path.join(tmpdir, "audit.jsonl"),
         server_name="test",
