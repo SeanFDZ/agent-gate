@@ -1,0 +1,72 @@
+gate:
+  name: "identity-test"
+  description: "Test policy with identity section"
+
+envelope:
+  allowed_paths:
+    - "${WORKDIR}/**"
+  denied_paths:
+    - "${HOME}/.ssh/**"
+    - "/tmp/.agent-gate-vault/**"
+
+vault:
+  path: "/tmp/.agent-gate-vault"
+  retention:
+    max_snapshots_per_file: 5
+    max_age_days: 7
+  naming: "{original_path_hash}/{timestamp}_{filename}"
+  on_failure: "deny"
+
+actions:
+  destructive:
+    patterns:
+      - command: "rm"
+        description: "File deletion"
+  read_only:
+    patterns:
+      - command: "cat"
+      - command: "ls"
+  blocked:
+    patterns:
+      - command: "rm"
+        args_contain: ["-rf /"]
+        description: "Recursive force delete at root"
+  network:
+    patterns:
+      - command: "curl"
+        description: "HTTP client"
+
+gate_behavior:
+  on_network:
+    default: "escalate"
+  on_unclassified:
+    default: "deny"
+
+identity:
+  source: "environment"
+  fields:
+    operator: "${AGENT_GATE_OPERATOR}"
+    agent_id: "${AGENT_GATE_AGENT_ID}"
+    service_account: "${AGENT_GATE_SERVICE}"
+    role: "${AGENT_GATE_ROLE}"
+
+  roles:
+    admin:
+      rate_limits:
+        global: { max_calls: 500, window_seconds: 60 }
+      actions:
+        network:
+          behavior: "allow"
+
+    restricted:
+      rate_limits:
+        global: { max_calls: 50, window_seconds: 60 }
+      envelope:
+        denied_paths_append:
+          - "${WORKDIR}/config/**"
+
+logging:
+  path: "/tmp/agent-gate-test-logs"
+  format: "jsonl"
+  log_allowed: true
+  log_denied: true

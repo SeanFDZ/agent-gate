@@ -2,9 +2,9 @@
 
 **Execution authority layer for AI agents - vault-backed rollback and policy enforcement.**
 
-Agent Gate sits between an AI agent's proposed tool calls and their execution.  It inspects every action as structured data, classifies it against pre-computed policy, enforces directory boundaries, controls operational tempo, and automatically backs up targets to an agent-unreachable vault before any destructive operation proceeds.
+Agent Gate sits between an AI agent's proposed tool calls and their execution.  It inspects every action as structured data, classifies it against pre-computed policy, enforces directory boundaries, binds identity to every decision, controls operational tempo, and automatically backs up targets to an agent-unreachable vault before any destructive operation proceeds.
 
-The agent runs at full autonomy and full speed.  The gate silently ensures every destructive action is reversible, every action stays within the authorized envelope, and no runaway loop overwhelms the systems the agent operates on.
+The agent runs at full autonomy and full speed.  The gate silently ensures every destructive action is reversible, every action stays within the authorized envelope, every decision is identity-attributed, and no runaway loop overwhelms the systems the agent operates on.
 
 ## The Problem
 
@@ -34,17 +34,20 @@ Agent proposes: rm important.txt
    ┌─────────────┐
    │  AGENT GATE │
    ├─────────────┤
-   │ 1. Literal? │  ← reject shell expansion ($VAR, $(cmd), globs)
-   │ 2. Tempo?   │  ← circuit breaker open? rate limit exceeded?
-   │ 3. Classify │  ← "rm" = destructive action
-   │ 4. Envelope │  ← is resolved path authorized? (follows symlinks)
-   │ 5. Vault    │  ← copy important.txt to vault
-   │ 6. Allow    │  ← backup confirmed, proceed
+   │ 1. Identity │  ← resolve operator, agent, role from env/config
+   │ 2. Literal? │  ← reject shell expansion ($VAR, $(cmd), globs)
+   │ 3. Tempo?   │  ← circuit breaker open? rate limit exceeded?
+   │ 4. Classify │  ← "rm" = destructive action
+   │ 5. Envelope │  ← is resolved path authorized? (follows symlinks)
+   │ 6. Vault    │  ← copy important.txt to vault
+   │ 7. Allow    │  ← backup confirmed, proceed
    └─────────────┘
          │
          ▼
    rm important.txt executes
 ```
+
+Identity is resolved once at gate initialization from environment variables, policy configuration, or MCP metadata.  The operator, agent, service account, and role are bound to every decision and every audit record, so the full chain of "who asked, through what agent, under what role, what happened" is captured without any per-call overhead.
 
 If the command contains shell expansion syntax, it's rejected before classification — the gate can't trust extracted paths when the shell would transform the command.  The agent is told to rewrite using literal values.
 
@@ -61,9 +64,10 @@ The vault lives outside the agent's permitted directory envelope. The same gate 
 3. **Inspect the action, not the reasoning.**  We don't need to understand why an agent wants to delete a file.  We see "rm" targeting a path and match it against policy.
 4. **Literal-only enforcement.**  The gate defines what "clean" looks like, literal paths, flags, and simple values, and rejects anything else.  Shell expansion syntax (`$VAR`, `$(cmd)`, globs, backticks) is denied before classification because the gate can't trust paths it can't read.  This is an allowlist on arguments, not a blocklist on shell tricks.
 5. **Operational envelope, not just authority envelope.**  Authorization answers "can this agent do this?"  Rate limiting answers "can this agent do this *right now*, given operational context?"  An agent operating within its authority can still cause a production incident by executing allowed operations too rapidly.
-6. **Tiered response.**  Auto-allow safe actions, vault-backup destructive ones, escalate network access, hard-stop prohibited ones.
-7. **Structured denial feedback.**  The gate doesn't just say "no."  It returns why, what would be required to proceed, and how much budget remains.
-8. **Policy traceability.**  Every audit record includes a cryptographic hash of the governing policy, proving which exact policy version made each decision.
+6. **Identity binding, not identity verification.**  Agent Gate doesn't authenticate users — it binds whatever identity context is present (operator, agent, service account, role) to every decision and audit record.  Authentication happens upstream.  The gate ensures that identity flows through the entire enforcement pipeline and that role-based overrides are applied consistently.
+7. **Tiered response.**  Auto-allow safe actions, vault-backup destructive ones, escalate network access, hard-stop prohibited ones.
+8. **Structured denial feedback.**  The gate doesn't just say "no."  It returns why, what would be required to proceed, and how much budget remains.
+9. **Policy traceability.**  Every audit record includes a cryptographic hash of the governing policy, proving which exact policy version made each decision.
 
 ## Tiered Classification
 
@@ -141,6 +145,66 @@ This follows the same principle as API rate limit headers (X-RateLimit-Remaining
 
 Repeated rate limit violations trigger exponential backoff (5s → 10s → 20s → 40s, capped at 5 minutes).  This prevents tight retry loops from becoming a denial-of-service vector against the systems the agent operates on.  A successful call within limits resets the backoff multiplier.
 
+## Identity Binding & RBAC
+
+Agent Gate binds identity context to every gate decision, implementing four of the five AARM R6 identity levels.  Identity is resolved once at gate initialization from environment variables or policy configuration, then propagated through the entire enforcement pipeline: gate decisions, audit records, and OPA policy input.
+
+### Five Identity Levels
+
+| AARM Level | Agent Gate Field | Source |
+|---|---|---|
+| Human identity | `operator` | `AGENT_GATE_OPERATOR` env var or config |
+| Service identity | `service_account` | `AGENT_GATE_SERVICE` env var or config |
+| Agent identity | `agent_id` | `AGENT_GATE_AGENT_ID` env var or config |
+| Session identity | `session_id` | Auto-generated UUID per session |
+| Role/privilege scope | `role` | `AGENT_GATE_ROLE` env var or config → RBAC |
+
+Identity resolution supports `${VAR}` environment variable expansion in policy fields, so the same policy file works across environments without modification.
+
+### Role-Based Policy Overrides
+
+Roles modify the base policy without replacing it.  An `admin` role can raise rate limits and allow network access while a `restricted` role can tighten limits and block access to configuration directories, all from the same policy file:
+
+```yaml
+identity:
+  source: "environment"
+  fields:
+    operator: "${AGENT_GATE_OPERATOR}"
+    agent_id: "${AGENT_GATE_AGENT_ID}"
+    service_account: "${AGENT_GATE_SERVICE}"
+    role: "${AGENT_GATE_ROLE}"
+
+  roles:
+    admin:
+      rate_limits:
+        global: { max_calls: 500, window_seconds: 60 }
+      actions:
+        network:
+          behavior: "allow"
+    restricted:
+      rate_limits:
+        global: { max_calls: 50, window_seconds: 60 }
+      envelope:
+        denied_paths_append:
+          - "${WORKDIR}/config/**"
+```
+
+Role overrides are applied via deep merge, meaning a role's rate limit overrides extend the base policy rather than replacing it.  Tool-specific limits that the role doesn't mention remain in effect.
+
+### Identity in Audit Records
+
+Every audit record includes the identity fields that were present at the time of the decision.  These fields are automatically included in the SHA-256 hash chain, so tampering with identity attribution breaks the chain the same way tampering with any other field would.
+
+```json
+{"timestamp":"2026-02-23T15:30:00Z","tool_name":"rm","arguments":{"command":"rm temp.log"},"verdict":"allow","tier":"destructive","operator":"sean","agent_id":"claude-code-1","role":"admin","prev_hash":"b4c8...","record_hash":"d9e2..."}
+```
+
+### Identity in OPA/Rego
+
+When using the OPA backend, identity is passed as `input.identity` in the OPA input document.  The YAML-to-Rego compiler generates RBAC helper rules (`role_has_override`, `role_behavior`, `role_rate_limit`) and role-specific test scaffolds automatically.
+
+Identity binding is fully optional and backward-compatible.  Policies without an `identity` section work identically to v0.2.0.
+
 ## Policy Backends
 
 Agent Gate supports two policy evaluation backends. The gate architecture (vault, routing, condition evaluation, denial feedback) is identical regardless of backend — only the classification engine differs.
@@ -182,7 +246,7 @@ classifier:
     package: "agent_gate"
 ```
 
-Best for: enterprise deployments, teams needing RBAC/policy composition, organizations already using OPA.
+Best for: enterprise deployments, teams needing RBAC/policy composition, identity-scoped policy decisions, organizations already using OPA.
 
 **Why OPA?**
 
@@ -416,6 +480,7 @@ This is a safety net for well-intentioned agents making mistakes.  It is not a s
 - **Application-layer gating, not OS-level sandboxing.**  Agent Gate operates at the tool call level — it inspects what the agent asks to do, not what programs do internally once executed.  If your policy allows `python3` (or any interpreter) and the script contains `os.remove()`, the gate sees a literal command and allows it.  The default policy classifies unknown commands (including `python3`) as unclassified and denies them — so this is a policy choice, not a gate bypass.  Full internal-execution coverage requires OS-level sandboxing (containers, seccomp, AppArmor), which is complementary to Agent Gate, not replaced by it.
 - **Path extraction** treats all non-flag arguments as potential paths — conservative but naive.  This errs on the side of safety (more things are checked against the envelope than necessary) but may produce false positives for commands with non-path arguments.
 - **Rate limiting state is in-memory.**  Counters and circuit breaker state reset when the gate process restarts.  This is acceptable for single-agent sessions but means rate limits don't persist across restarts.  For long-running multi-agent deployments, a shared state backend (Redis, etc.) would be needed.
+- **Identity binding, not identity verification.**  Agent Gate binds identity context from environment variables and configuration but does not authenticate against an external identity provider.  It implements four of five AARM R6 identity levels — external IdP integration (the fifth level) is a roadmap item.  Authentication is expected to happen upstream of the gate.
 - **Vault backup is not yet wired for MCP tool calls.**  The MCP proxy classifies tool calls and enforces envelope boundaries, but the vault's pre-destruction backup currently operates on bash commands and file write paths.  An MCP `delete_file` call will be correctly classified as destructive and denied or escalated by policy — but it won't trigger an automatic vault snapshot the way `rm` does through the Claude Code hook.  Extending vault coverage to MCP tool arguments is a future item.
 
 ## Quick Start
@@ -425,7 +490,7 @@ cd agent-gate
 pip3 install pyyaml
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
-# Run all test suites (220+ Python tests)
+# Run all test suites (310+ Python tests)
 python3 -m pytest tests/ -v
 
 # Run OPA policy tests (24/24 Rego tests, requires opa binary)
@@ -482,6 +547,20 @@ rate_limits:
     enabled: true
     failure_rate_threshold: 0.50
     wait_duration_open_seconds: 30
+
+# Optional — omit entirely for uniform policy (no identity/RBAC)
+# See "Identity Binding & RBAC" section above for full schema
+identity:
+  source: "environment"
+  fields:
+    operator: "${AGENT_GATE_OPERATOR}"
+    role: "${AGENT_GATE_ROLE}"
+  roles:
+    admin:
+      rate_limits:
+        global: { max_calls: 500, window_seconds: 60 }
+      actions:
+        network: { behavior: "allow" }
 ```
 
 See [policies/default.yaml](policies/default.yaml) for the full default policy.
@@ -511,7 +590,7 @@ blocked_patterns := {
 }
 ```
 
-See [rego/agent_gate.rego](rego/agent_gate.rego) for the full Rego policy.  The YAML-to-Rego compiler (`yaml_to_rego.py`) generates equivalent Rego from your YAML policy, including rate limit threshold rules when `rate_limits` is configured.  Run `opa test ./rego/ -v` to execute the policy unit tests.
+See [rego/agent_gate.rego](rego/agent_gate.rego) for the full Rego policy.  The YAML-to-Rego compiler (`yaml_to_rego.py`) generates equivalent Rego from your YAML policy, including rate limit threshold rules when `rate_limits` is configured and RBAC identity rules when `identity.roles` is configured.  Run `opa test ./rego/ -v` to execute the policy unit tests.
 
 ## The Nuclear C2 Analogy
 
@@ -521,50 +600,65 @@ This architecture is inspired by Permissive Action Links (PALs) in nuclear comma
 - **The gate must not prevent authorized actions.**  A gate that's too restrictive is as dangerous as one that's too permissive.
 - **The backup vault is like the safing mechanism.**  It doesn't prevent the action — it ensures the action is reversible.
 - **Nuclear launch sequences have timing constraints and sequencing requirements separate from authorization codes.**  Rate limiting and circuit breakers enforce the operational envelope, the same way launch procedures enforce cadence independently of authority.
+- **Nuclear authority is always attributed — every command in the chain knows who issued it.**  Identity binding ensures every gate decision records the operator, agent, and role, creating the same end-to-end attribution chain.
 
 ## Architecture
 ```
 agent_gate/
 ├── gate.py              # Gate core — intercept, classify, route, decide
+├── identity.py          # Identity resolver — AARM R6 identity levels, env/config resolution
 ├── classifier_base.py   # Abstract classifier with shared pre-processing
 ├── classifier.py        # Python backend — YAML policies, pure Python eval
 ├── opa_classifier.py    # OPA backend — Rego policies via subprocess or HTTP
 ├── vault.py             # Vault manager — backup before destruction
-├── policy_loader.py     # YAML policy parser, validator, and policy hash
+├── policy_loader.py     # YAML policy parser, validator, identity/role config, and policy hash
 ├── rate_tracker.py      # Sliding window counters, circuit breaker, backoff
 ├── cli.py               # Human-facing rollback interface
-├── mcp_proxy.py         # MCP proxy — transparent stdio interception layer
+├── mcp_proxy.py         # MCP proxy — transparent stdio interception layer with identity
 ├── mcp_jsonrpc.py       # JSON-RPC 2.0 parser for MCP protocol messages
 ├── proxy_config.py      # Proxy configuration loader (env/file/defaults)
-├── audit.py             # Structured JSONL audit logger with hash chaining and policy hash
-└── yaml_to_rego.py      # YAML-to-Rego compiler (including rate limit rules)
+├── audit.py             # Structured JSONL audit logger with hash chaining, policy hash, and identity
+└── yaml_to_rego.py      # YAML-to-Rego compiler (rate limits + RBAC identity rules)
 rego/
 ├── agent_gate.rego      # OPA policy (equivalent to default.yaml)
 └── agent_gate_test.rego # Formal policy unit tests
 integrations/
 └── claude_code/         # Claude Code PreToolUse hook integration
-    ├── agent_gate_hook.py       # Bash tool hook
-    ├── agent_gate_hook_write.py # Write/Edit tool hook
+    ├── agent_gate_hook.py       # Bash tool hook (with identity resolution)
+    ├── agent_gate_hook_write.py # Write/Edit tool hook (with identity resolution)
     ├── settings_example.json    # Hook configuration
     └── test_setup.sh            # Test environment setup
 tests/
-├── test_gate.py                # Core gate tests
-├── test_gate_rates.py          # Rate limiting integration tests
-├── test_gate_feedback.py       # Rate-limited agent feedback tests
-├── test_rate_tracker.py        # Sliding window counter and circuit breaker tests
-├── test_policy_loader_rates.py # Rate limits schema validation tests
-├── test_audit.py               # Audit logger tests
-├── test_audit_hash.py          # Policy hash and rate context audit tests
-├── test_mcp_jsonrpc.py         # JSON-RPC parser tests
-├── test_proxy_config.py        # Config loader tests
-├── test_mcp_proxy.py           # MCP proxy unit tests
-└── test_integration_mcp.py     # Live integration tests
+├── test_gate.py                   # Core gate tests
+├── test_gate_identity.py          # Identity propagation and role override tests
+├── test_gate_rates.py             # Rate limiting integration tests
+├── test_gate_feedback.py          # Rate-limited agent feedback tests
+├── test_identity.py               # Identity resolver unit tests
+├── test_rate_tracker.py           # Sliding window counter and circuit breaker tests
+├── test_policy_loader_rates.py    # Rate limits schema validation tests
+├── test_policy_loader_identity.py # Identity section and role override validation tests
+├── test_audit.py                  # Audit logger tests
+├── test_audit_hash.py             # Policy hash and rate context audit tests
+├── test_audit_identity.py         # Identity fields in audit records tests
+├── test_opa_identity.py           # OPA identity input and RBAC Rego generation tests
+├── test_mcp_jsonrpc.py            # JSON-RPC parser tests
+├── test_proxy_config.py           # Config loader tests
+├── test_mcp_proxy.py              # MCP proxy unit tests
+├── test_mcp_proxy_identity.py     # MCP proxy identity resolution tests
+└── test_integration_mcp.py        # Live integration tests
 ```
 
 ### Gate Evaluation Pipeline
 
 ```
-Tool Call → Rate Check (O(1) counter lookup)
+Identity Resolution (once at init)
+  │
+  ├── Resolve operator, agent_id, service_account, role
+  ├── Apply role-based rate limit overrides (deep merge)
+  ├── Apply role-based gate behavior overrides
+  │
+  ▼
+Tool Call → Rate Check (O(1) counter lookup, role-adjusted limits)
               │
               ├── Circuit breaker OPEN? → DENY
               ├── Tool rate exceeded? → DENY/ESCALATE
@@ -582,9 +676,13 @@ Tool Call → Rate Check (O(1) counter lookup)
                           │
                           ├── PythonClassifier: YAML patterns, fnmatch envelope
                           └── OPAClassifier: Rego evaluation via subprocess/HTTP
+                                              (input.identity for RBAC decisions)
+              │
+              ▼
+        GateDecision (includes identity context for audit binding)
 ```
 
-Rate checks happen before classification because they're O(1) counter comparisons, not policy evaluation.  A rate-tripped agent is stopped at the earliest possible point.  Pre-processing is structural and backend-independent.  Envelope checking and tier matching are policy decisions — this is what the backend implements.
+Identity resolution happens once at gate initialization, not per-call.  Rate checks happen before classification because they're O(1) counter comparisons, not policy evaluation.  A rate-tripped agent is stopped at the earliest possible point.  Pre-processing is structural and backend-independent.  Envelope checking and tier matching are policy decisions — this is what the backend implements.
 
 ## Roadmap
 
@@ -594,6 +692,7 @@ Rate checks happen before classification because they're O(1) counter comparison
 - **Phase 3** ✅ — MCP proxy (transparent stdio proxy intercepting `tools/call`, live integration tests with filesystem MCP server)
 - **Phase 4** ✅ — OPA/Rego policy engine (dual-backend classifier, formal Rego policy tests)
 - **Phase 5** ✅ — Rate limiting & circuit breaker (sliding window counters, three-state circuit breaker, per-tool/per-tier/global limits, exponential backoff, policy hash traceability in audit records, Rego compiler support)
+- **Phase 6** ✅ — Identity binding & RBAC (AARM R6 identity levels, environment/config resolution, role-based rate limit and gate behavior overrides, identity-attributed audit records, OPA/Rego RBAC rules, MCP proxy identity propagation)
 
 ## The Gap This Fills
 
@@ -603,9 +702,9 @@ Rate checks happen before classification because they're O(1) counter comparison
 | Agent orchestration platforms | Airia, Astrix ACP | Fleet management, routing, cost optimization, governance dashboards | Pre-execution authority on individual tool calls |
 | Agent sandboxes | nono, cco, Claude sandbox | Directory scoping | Pre-backup on destruction |
 | Checkpoint tools | ccundo, git stash | Rollback after the fact | Agent can delete its own backups |
-| **Agent Gate** | — | **Pre-execution authority + vault backup + rate limiting + circuit breaker + agent-unreachable recovery + policy-as-code (YAML or OPA/Rego) + policy-hash audit traceability** | — |
+| **Agent Gate** | — | **Pre-execution authority + identity-attributed decisions + RBAC role overrides + vault backup + rate limiting + circuit breaker + agent-unreachable recovery + policy-as-code (YAML or OPA/Rego) + policy-hash audit traceability** | — |
 
-**Why not just use Airia or Guardrails AI?**  They solve different problems.  Guardrails AI validates what an LLM *outputs* (content safety, PII filtering, hallucination detection) — it assumes the agent is already authorized to act.  Airia is an enterprise orchestration platform — it manages which agents run, routes requests between models, and provides governance dashboards.  Neither inspects individual tool calls against risk tiers before execution, neither provides vault-backed rollback that the agent can't reach, and neither enforces operational tempo limits to prevent runaway loops.  Agent Gate is the enforcement layer that sits inside the execution pipeline, not above it.
+**Why not just use Airia or Guardrails AI?**  They solve different problems.  Guardrails AI validates what an LLM *outputs* (content safety, PII filtering, hallucination detection) — it assumes the agent is already authorized to act.  Airia is an enterprise orchestration platform — it manages which agents run, routes requests between models, and provides governance dashboards.  Neither inspects individual tool calls against risk tiers before execution, neither provides vault-backed rollback that the agent can't reach, neither enforces operational tempo limits to prevent runaway loops, and neither binds identity context to every authorization decision for end-to-end attribution.  Agent Gate is the enforcement layer that sits inside the execution pipeline, not above it.
 
 ## License
 
@@ -618,8 +717,9 @@ Sean Lavigne — [GitHub](https://github.com/SeanFDZ)
 ---
 
 Agent Gate's enforcement pattern maps to NIST SP 800-53 AC-3 (Access Enforcement),
-AU-9 (Protection of Audit Information), AU-10 (Non-repudiation), CM-3
-(Configuration Change Control), CP-9 (System Backup), SC-5 (Denial-of-Service
-Protection), SI-4 (System Monitoring), SI-17 (Fail-Safe Procedures), and NIST AI
-RMF MG-2.4 (Contain AI System Impact), GOVERN 1.7 (Operational Risk Management),
-and MEASURE 2.6 (Performance Monitoring).
+AC-3(7) (Role-Based Access Control), AU-9 (Protection of Audit Information),
+AU-10 (Non-repudiation), CM-3 (Configuration Change Control), CP-9 (System Backup),
+IA-2 (Identification and Authentication), IA-4 (Identifier Management),
+SC-5 (Denial-of-Service Protection), SI-4 (System Monitoring), SI-17 (Fail-Safe
+Procedures), and NIST AI RMF MG-2.4 (Contain AI System Impact), GOVERN 1.7
+(Operational Risk Management), and MEASURE 2.6 (Performance Monitoring).

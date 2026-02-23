@@ -22,6 +22,7 @@ if AGENT_GATE_ROOT not in sys.path:
     sys.path.insert(0, AGENT_GATE_ROOT)
 
 from agent_gate.gate import Gate, Verdict
+from agent_gate.identity import resolve_identity
 
 # --- Configuration ---
 POLICY_PATH = os.environ.get(
@@ -29,6 +30,7 @@ POLICY_PATH = os.environ.get(
     os.path.join(AGENT_GATE_ROOT, "policies", "default.yaml"),
 )
 WORKDIR = os.environ.get("AGENT_GATE_WORKDIR", os.getcwd())
+SESSION_ID = os.environ.get("AGENT_GATE_SESSION", None)
 
 
 def main():
@@ -52,9 +54,11 @@ def main():
     # Resolve to absolute path (handle ~ and relative paths)
     file_path = os.path.abspath(os.path.expanduser(file_path))
 
-    # Initialize the gate
+    # Initialize identity and gate
+    identity = resolve_identity(session_id=SESSION_ID)
+
     try:
-        gate = Gate(policy_path=POLICY_PATH, workdir=WORKDIR)
+        gate = Gate(policy_path=POLICY_PATH, workdir=WORKDIR, identity=identity)
     except Exception as e:
         print(
             f"[AGENT GATE] ERROR: Gate initialization failed: {e}",

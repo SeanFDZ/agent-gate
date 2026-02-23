@@ -1,7 +1,7 @@
 # AARM Alignment Assessment — Agent Gate
 
-**Document version:** 0.2.0
-**Agent Gate version:** 0.2.0 (Phase 5: Rate Limiting & Circuit Breaker)
+**Document version:** 0.3.0
+**Agent Gate version:** 0.3.0 (Phase 6: Identity Binding)
 **AARM Specification version:** v0.1
 **Date:** 2026-02-23
 **Status:** Gap analysis — this is NOT a conformance claim
@@ -28,7 +28,7 @@ AARM defines four implementation architectures. Agent Gate's MCP proxy maps to t
 | **Bypass resistance** | High | High — all tool calls transit the proxy |
 | **Context richness** | Limited | Limited — sees tool calls and verdicts, not model reasoning |
 | **Defer support** | Partial | Not implemented |
-| **AARM-conformant standalone** | Yes | Not yet — gaps in R2–R6 |
+| **AARM-conformant standalone** | Yes | Not yet — partial on R2–R6, no gaps |
 
 Agent Gate's architecture places enforcement at the protocol boundary between client and server. The proxy is transparent to both sides: the client believes it is communicating with the MCP server directly, and the server believes it is communicating with the client. This is architecturally consistent with AARM's Protocol Gateway model, where enforcement occurs at a chokepoint with high bypass resistance.
 
@@ -192,26 +192,37 @@ Agent Gate has structured logging with SHA-256 hash chaining for tamper evidence
 
 ---
 
-#### R6: Identity Binding ❌ Gap
+#### R6: Identity Binding ⚠️ Partial
 
 > *Requirement: Bind actions to identity at five levels — human, service, agent, session, and role/privilege scope.*
 
-Agent Gate does not implement identity binding. The proxy generates a session UUID and tracks a server name, but does not authenticate, authorize, or bind any identity to actions.
+Agent Gate v0.3.0 implements environment/config-based identity binding at four of five AARM identity levels, with role-based policy differentiation (RBAC).
 
 | AARM Identity Level | Agent Gate Status |
 |---|---|
-| Human identity | ❌ No user/operator identity |
-| Service identity | ⚠️ Server name captured in audit log |
-| Agent identity | ❌ No agent identity tracking |
-| Session identity | ⚠️ UUID-based `session_id` generated per proxy lifecycle |
-| Role/privilege scope | ❌ No RBAC, no role-based policy differentiation |
+| Human identity | ⚠️ `operator` field — environment variable or config |
+| Service identity | ⚠️ `service_account` field — environment variable or config |
+| Agent identity | ⚠️ `agent_id` field — environment variable or config |
+| Session identity | ✅ UUID-based `session_id` — auto-generated per session |
+| Role/privilege scope | ⚠️ `role` field — drives RBAC policy differentiation |
 
 **Implementation evidence:**
-- `mcp_proxy.py`: `self.session_id = str(uuid.uuid4())[:8]` — session-scoped but not identity-bound
-- `audit.py`: `AuditRecord.session_id` and `AuditRecord.server_name` fields exist
-- No authentication mechanism at any layer
+- `identity.py`: `IdentityContext` frozen dataclass with five fields mapping to AARM identity levels
+- `identity.py`: `resolve_identity()` resolves from YAML config (`${VAR}` references), environment variables, or defaults
+- `policy_loader.py`: `identity.roles` section defines per-role overrides for rate limits, gate behavior, and envelope
+- `gate.py`: Role overrides applied to rate limits and gate behavior at initialization; identity propagated through all decisions
+- `audit.py`: `operator`, `agent_id`, `service_account`, `role` fields on every AuditRecord
+- `opa_classifier.py`: `input.identity` in OPA input document enables attribute-based decisions in Rego
+- `yaml_to_rego.py`: Generates RBAC Rego rules from role definitions
+- `mcp_proxy.py`: Identity resolved at proxy startup, propagated to gate and audit
 
-**Gap:** This is Agent Gate's largest structural gap relative to AARM Core. Identity binding requires integration with external identity providers (OAuth, OIDC, mTLS certificates, API keys) and a mechanism to propagate identity through the evaluation pipeline so that policies can differentiate authorization based on who is requesting the action, not just what the action is.
+**Remaining gap:** Identity claims come from environment variables and configuration, not from authenticated identity providers (OAuth/OIDC, mTLS, API key validation).  The operator who configures the environment is trusted to provide accurate identity.  Full R6 satisfaction requires integration with external IdP for cryptographic identity verification.
+
+**What this enables:**
+- Multi-agent policy differentiation (admin vs. restricted)
+- Audit records that answer "who authorized this?"
+- Foundation for JIT authority grants (R9)
+- Foundation for signed receipts with identity binding (R5)
 
 ---
 
@@ -256,12 +267,12 @@ Agent Gate does not manage credentials. MCP server credentials pass through the 
 | **R3** | MUST | Policy evaluation with intent alignment | ⚠️ Partial (improved) | Static policy + context-dependent deny via circuit breaker and rate limits; no intent alignment |
 | **R4** | MUST | Five authorization decisions | ⚠️ Partial | ALLOW and DENY implemented; ESCALATE ≈ STEP_UP without completion; no MODIFY or DEFER |
 | **R5** | MUST | Tamper-evident receipts | ⚠️ Partial (improved) | Hash-chained JSONL with policy_hash binding and rate_context snapshots; no cryptographic signing |
-| **R6** | MUST | Identity binding | ❌ Gap | Session UUID only; no human/agent/service/role identity |
+| **R6** | MUST | Identity binding | ⚠️ Partial | Environment/config-based identity at 4 of 5 levels; RBAC via role-based policy overrides |
 | **R7** | SHOULD | Semantic distance tracking | ❌ Gap | No embedding or drift detection |
 | **R8** | SHOULD | Telemetry export | ⚠️ Foundation laid | Structured JSONL with OpenTelemetry-ready fields; no SIEM/SOAR transport |
 | **R9** | SHOULD | Least privilege / JIT credentials | ❌ Gap | Aligns with planned JIT authority grants feature |
 
-**AARM Core (R1–R6):** 1 of 6 fully satisfied.  4 of 6 partially satisfied (3 improved since v0.1.0).  1 gap.
+**AARM Core (R1–R6):** 1 of 6 fully satisfied.  5 of 6 partially satisfied (3 improved since v0.1.0).  0 gaps.
 **AARM Extended (R7–R9):** 0 of 3 fully satisfied.  1 foundation laid.
 
 ---
@@ -303,14 +314,14 @@ Agent Gate now has hash-chained audit records with policy hash binding and parti
 - Include full session context snapshot on every record, not just rate-limited decisions
 - Sign receipts with a process-local key (minimum) or an HSM/KMS-backed key (production) — hash chaining provides tamper detection but not non-repudiation
 
-### 5. Identity Binding (R6)
+### 5. Identity Binding (R6) — Partially Implemented
 
-This is the most significant gap. Options:
-- **MCP protocol extension:** If the MCP `initialize` handshake evolves to include client identity claims, the proxy can capture and propagate them
-- **Configuration-based:** Bind identity via proxy configuration (operator identity, service account) at startup
-- **External authentication:** Integrate with OAuth/OIDC providers for human identity, API key validation for service identity
+v0.3.0 implements environment/config-based identity binding with RBAC policy differentiation.  Remaining work for full R6:
 
-Minimum viable approach: accept identity claims via environment variables or configuration, propagate through the evaluation pipeline, and include in receipts.
+- Integration with OAuth/OIDC for authenticated human identity
+- mTLS certificate validation for service identity
+- MCP protocol metadata extraction when HTTP transport is supported
+- JIT authority grants scoped to identity (AARM R9 prerequisite)
 
 ---
 
@@ -334,6 +345,14 @@ Agent Gate's vault-backed rollback pattern is not addressed by AARM but represen
 ---
 
 ## Changelog
+
+### v0.3.0 (2026-02-23) — Identity Binding
+
+Phase 6 implementation (identity binding, RBAC, role-based policy overrides) closed the last remaining AARM Core gap:
+
+- **R6 (Identity Binding):** Moved from ❌ Gap to ⚠️ Partial.  `IdentityContext` frozen dataclass maps to four of five AARM identity levels (operator, service_account, agent_id, session_id) plus role for RBAC.  Identity resolved from environment variables or YAML config with `${VAR}` expansion.  Role-based policy overrides for rate limits, gate behavior (action tier handling), and envelope restrictions.  Identity propagated through gate evaluation pipeline, included in every audit record, and passed to OPA as `input.identity` for attribute-based decisions.  RBAC Rego rules auto-generated by `yaml_to_rego.py`.
+
+AARM Core (R1–R6): 0 gaps remaining.  1 fully satisfied, 5 partially satisfied.
 
 ### v0.2.0 (2026-02-23) — Rate Limiting & Circuit Breaker
 

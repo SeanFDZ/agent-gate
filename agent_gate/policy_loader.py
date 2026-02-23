@@ -9,7 +9,7 @@ import os
 import re
 import yaml
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 class PolicyValidationError(Exception):
@@ -45,6 +45,12 @@ class Policy:
         self.gate_behavior = self._raw["gate_behavior"]
         self.logging_config = self._raw.get("logging", {})
         self.rate_limits = self._raw.get("rate_limits", {})
+
+        # Identity section (optional — backward compatible)
+        self.identity_config = self._raw.get("identity", {})
+        self.identity_fields = self.identity_config.get("fields", {})
+        self.identity_source = self.identity_config.get("source", "environment")
+        self.identity_roles = self.identity_config.get("roles", {})
 
     @property
     def policy_hash(self) -> str:
@@ -141,6 +147,10 @@ class Policy:
         # Validate rate_limits if present
         if "rate_limits" in self._raw:
             self._validate_rate_limits()
+
+        # Validate identity if present
+        if "identity" in self._raw:
+            self._validate_identity()
 
     def _validate_rate_limits(self):
         """Validate the optional rate_limits section.  Only called when present."""
@@ -335,6 +345,124 @@ class Policy:
                             f"be one of {valid_on_exceed}, "
                             f"got '{cb['on_trip']}'"
                         )
+
+    def _validate_identity(self):
+        """Validate the optional identity section."""
+        identity = self._raw["identity"]
+        if not isinstance(identity, dict):
+            raise PolicyValidationError(
+                "identity must be a mapping"
+            )
+
+        # Validate source
+        valid_sources = {"environment", "config", "mcp_metadata", "header"}
+        source = identity.get("source", "environment")
+        if source not in valid_sources:
+            raise PolicyValidationError(
+                f"identity.source must be one of {valid_sources}, "
+                f"got '{source}'"
+            )
+
+        # Validate fields (if present)
+        fields = identity.get("fields", {})
+        if not isinstance(fields, dict):
+            raise PolicyValidationError(
+                "identity.fields must be a mapping"
+            )
+        valid_field_names = {
+            "operator", "agent_id", "service_account",
+            "session_id", "role"
+        }
+        for key in fields:
+            if key not in valid_field_names:
+                raise PolicyValidationError(
+                    f"identity.fields.{key} is not a recognized "
+                    f"identity field.  Valid: {valid_field_names}"
+                )
+
+        # Validate roles (if present)
+        roles = identity.get("roles", {})
+        if not isinstance(roles, dict):
+            raise PolicyValidationError(
+                "identity.roles must be a mapping"
+            )
+        for role_name, role_config in roles.items():
+            if not isinstance(role_config, dict):
+                raise PolicyValidationError(
+                    f"identity.roles.{role_name} must be a mapping"
+                )
+            self._validate_role_overrides(role_name, role_config)
+
+    def _validate_role_overrides(self, role_name: str, role_config: dict):
+        """Validate a single role's override configuration."""
+        valid_override_keys = {
+            "rate_limits", "actions", "envelope",
+        }
+        for key in role_config:
+            if key not in valid_override_keys:
+                raise PolicyValidationError(
+                    f"identity.roles.{role_name}.{key} is not a "
+                    f"valid override key.  "
+                    f"Valid: {valid_override_keys}"
+                )
+
+        # Validate rate_limits overrides (same shape as top-level)
+        if "rate_limits" in role_config:
+            rl = role_config["rate_limits"]
+            if not isinstance(rl, dict):
+                raise PolicyValidationError(
+                    f"identity.roles.{role_name}.rate_limits "
+                    f"must be a mapping"
+                )
+            # Validate global override if present
+            if "global" in rl:
+                g = rl["global"]
+                if "max_calls" in g:
+                    if not isinstance(g["max_calls"], int) or g["max_calls"] < 0:
+                        raise PolicyValidationError(
+                            f"identity.roles.{role_name}."
+                            f"rate_limits.global.max_calls "
+                            f"must be a non-negative integer"
+                        )
+
+        # Validate actions overrides
+        if "actions" in role_config:
+            acts = role_config["actions"]
+            if not isinstance(acts, dict):
+                raise PolicyValidationError(
+                    f"identity.roles.{role_name}.actions "
+                    f"must be a mapping"
+                )
+            valid_behaviors = {"allow", "deny", "escalate"}
+            for tier_name, tier_cfg in acts.items():
+                if isinstance(tier_cfg, dict):
+                    behavior = tier_cfg.get("behavior")
+                    if behavior and behavior not in valid_behaviors:
+                        raise PolicyValidationError(
+                            f"identity.roles.{role_name}.actions."
+                            f"{tier_name}.behavior must be one of "
+                            f"{valid_behaviors}"
+                        )
+
+        # Validate envelope overrides
+        if "envelope" in role_config:
+            env = role_config["envelope"]
+            if not isinstance(env, dict):
+                raise PolicyValidationError(
+                    f"identity.roles.{role_name}.envelope "
+                    f"must be a mapping"
+                )
+
+    def get_role_overrides(self, role: str) -> Optional[dict]:
+        """
+        Return the override config for a given role, or None.
+
+        The override dict may contain:
+          - rate_limits: merged with base rate_limits
+          - actions: tier behavior overrides
+          - envelope: denied_paths_append list
+        """
+        return self.identity_roles.get(role)
 
     def __repr__(self):
         return f"Policy(name='{self.name}', allowed={len(self.allowed_paths)} paths)"

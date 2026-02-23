@@ -1,7 +1,7 @@
 # Compliance Framework Mapping — Agent Gate
 
-**Document version:** 0.2.0
-**Agent Gate version:** 0.2.0 (Phase 5: Rate Limiting & Circuit Breaker)
+**Document version:** 0.3.0
+**Agent Gate version:** 0.3.0 (Phase 6: Identity Binding)
 **Date:** 2026-02-23
 **Status:** Implementation mapping — this is NOT a certification or accreditation claim
 
@@ -26,7 +26,7 @@ SP 800-53 defines the security control catalog used across federal systems. Agen
 | Control | Title | Agent Gate Mapping | Status |
 |---|---|---|---|
 | **AC-3** | Access Enforcement | Gate evaluates every tool call against policy before execution.  The `Gate.evaluate()` method is the enforcement function — no tool call reaches execution without passing through it.  Tiered classification (read-only, destructive, network, blocked, unclassified, rate-limited) implements differentiated access decisions.  Rate limits and circuit breaker provide dynamic enforcement that adapts to operational context. | ✅ Implemented |
-| **AC-3(7)** | Role-Based Access Control | Not implemented. Agent Gate enforces policy uniformly — there is no role or identity differentiation in access decisions. | ❌ Gap |
+| **AC-3(7)** | Role-Based Access Control | Identity roles defined in policy YAML with per-role overrides for rate limits, gate behavior (action tier handling), and envelope restrictions.  RBAC evaluation in both Python and OPA backends.  Role resolved from environment or configuration at gate initialization. | ✅ Implemented |
 | **AC-3(8)** | Revocation of Access Authorizations | Policy changes take effect on next gate initialization. There is no runtime revocation mechanism for in-flight sessions. | ⚠️ Partial |
 | **AC-4** | Information Flow Enforcement | Envelope enforcement restricts which paths the agent can access. Denied paths (e.g., `~/.ssh/**`, `~/.aws/**`, `/etc/**`) define information flow boundaries. Symlink resolution prevents path traversal. | ✅ Implemented |
 | **AC-6** | Least Privilege | Default-deny posture for unclassified actions. The agent operates within a declared envelope — anything outside the envelope is denied. Network access requires explicit policy enablement or human escalation. | ✅ Implemented |
@@ -44,8 +44,15 @@ SP 800-53 defines the security control catalog used across federal systems. Agen
 | **AU-8** | Time Stamps | Timestamps use `datetime.now(timezone.utc).isoformat()` — UTC with timezone designation. | ✅ Implemented |
 | **AU-9** | Protection of Audit Information | The audit log file resides in a configurable path (default: `~/.config/agent-gate/audit.jsonl`). The vault directory — which is envelope-denied — protects vault manifests. However, the audit log file itself is not in the vault and could theoretically be modified by an agent with sufficient file system access. | ⚠️ Partial |
 | **AU-9(3)** | Cryptographic Protection of Audit Information | SHA-256 hash chaining implemented.  Each audit record includes `prev_hash` (hash of previous record) and `record_hash` (hash of current record content), creating a tamper-evident chain from a deterministic genesis value.  `verify_chain()` walks the log and detects any modification, insertion, or deletion.  Records also include `policy_hash` binding each decision to the governing policy version.  Records are not yet signed with a cryptographic key. | ⚠️ Partial |
-| **AU-10** | Non-repudiation | Partial.  Hash-chained audit records with `policy_hash` binding prove which policy version governed each decision, preventing retroactive policy modification from disguising the original authorization logic.  However, records are not digitally signed — the chain proves integrity (tampering is detectable) but not identity (cannot cryptographically prove who created the record). | ⚠️ Partial |
+| **AU-10** | Non-repudiation | Hash-chained audit records with policy hash binding AND identity binding (operator, agent_id, service_account, role on every record).  Identity fields included in record hash, providing tamper evidence for identity claims.  Still needs cryptographic signing for full non-repudiation. | ⚠️ Improved |
 | **AU-11** | Audit Record Retention | Vault snapshots have configurable retention (`max_snapshots_per_file`, `max_age_days`). The audit log itself has no automated retention management. | ⚠️ Partial |
+
+### Identification and Authentication (IA)
+
+| Control | Title | Agent Gate Mapping | Status |
+|---|---|---|---|
+| **IA-2** | Identification and Authentication | Identity context resolved from environment/config at startup.  Identity claims propagated through evaluation pipeline and bound to audit records.  Not yet authenticated against external IdP. | ⚠️ Partial |
+| **IA-4** | Identifier Management | Unique session_id auto-generated per gate/proxy lifecycle.  operator, agent_id, and service_account identifiers configurable via environment or policy. | ⚠️ Partial |
 
 ### Contingency Planning (CP)
 
@@ -155,7 +162,7 @@ M-24-10 establishes requirements for federal agencies deploying AI. Agent Gate a
 
 | Framework | Controls Mapped | ✅ Implemented | ⚠️ Partial/Supportive | ❌ Gap |
 |---|---|---|---|---|
-| **SP 800-53** | 29 controls | 22 | 6 | 1 |
+| **SP 800-53** | 31 controls | 23 | 8 | 0 |
 | **AI RMF** | 12 subcategories | 9 | 2 | 1 (n/a) |
 | **ISO 42001** | 6 clauses | 1 | 4 | 1 (n/a) |
 | **OMB M-24-10** | 5 requirements | 4 | 1 | 0 |
@@ -167,6 +174,7 @@ M-24-10 establishes requirements for federal agencies deploying AI. Agent Gate a
 - **SC-5 (Denial-of-Service Protection)** — Per-tool, per-tier, and global rate limits with circuit breaker prevent agents from overwhelming target systems.  Exponential backoff prevents retry loops.
 - **SI-17 (Fail-Safe Procedures)** — Three-state circuit breaker transitions to known-safe state (read-only) when failure rates exceed thresholds.  Automatic recovery via HALF_OPEN probing.
 - **CM-3 (Configuration Change Control)** — `policy_hash` on every audit record creates cryptographic binding between decisions and governing policy versions.
+- **AC-3(7) (Role-Based Access Control)** — Identity roles with per-role policy overrides for rate limits, gate behavior, and envelope restrictions.  RBAC in both Python and OPA backends.
 - **MG-2.4 (Containment of Impact)** — Envelope enforcement, vault backup, rate limiting, circuit breaker, and default-deny collectively bound the impact of agent operations.
 - **M-24-10 §5(c)(ii)(B) (Halt Operations)** — Deterministic blocking of prohibited actions and automatic circuit breaker tripping with no model-in-the-loop uncertainty.
 
@@ -177,8 +185,14 @@ M-24-10 establishes requirements for federal agencies deploying AI. Agent Gate a
 
 ### Remaining Known Gaps
 
-- **AC-3(7) (Role-based access control)** — No identity or role differentiation.  All agents are subject to the same policy.  This is also the largest gap in the AARM alignment (R6 Identity Binding).
-- **AU-10 (Non-repudiation, full)** — Hash chaining proves integrity but not authorship.  Full non-repudiation requires cryptographic signing with identity-bound keys.
+- **No ❌ gaps remaining** in SP 800-53 mapping.  All previously identified gaps have been closed or narrowed to partial.
+- **AU-10 (Non-repudiation, full)** — Hash chaining with identity binding proves integrity and associates decisions with identity claims, but records are not digitally signed.  Full non-repudiation requires cryptographic signing with identity-bound keys.
+- **IA-2 / IA-4 (Identification)** — Identity claims are environment/config-based, not authenticated against external IdP.
+
+### Gaps Closed Since v0.2.0
+
+- **AC-3(7) (Role-based access control)** — Was ❌ Gap, now ✅ Implemented.  Identity roles with per-role overrides for rate limits, gate behavior, and envelope.  RBAC in Python and OPA backends.
+- **AU-10 (Non-repudiation)** — Improved from ⚠️ Partial to ⚠️ Improved.  Identity fields (operator, agent_id, service_account, role) now included in every audit record and in the record hash.
 
 ### Gaps Narrowed
 
@@ -192,6 +206,22 @@ The [AARM Alignment Assessment](AARM_Alignment.md) covers Agent Gate's mapping t
 ---
 
 ## Changelog
+
+### v0.3.0 (2026-02-23) — Identity Binding
+
+Phase 6 implementation closed the last remaining SP 800-53 gap:
+
+**Gaps closed:**
+- **AC-3(7) (RBAC)** — ❌ → ✅  Role-based access control with per-role policy overrides
+
+**Controls upgraded:**
+- **AU-10** — ⚠️ → ⚠️ Improved  Identity binding in audit records provides stronger non-repudiation evidence
+
+**New controls mapped:**
+- **IA-2 (Identification and Authentication)** — Identity context resolved from environment/config ⚠️
+- **IA-4 (Identifier Management)** — Session, operator, agent, and service identifiers managed ⚠️
+
+**Net effect:** SP 800-53 gaps reduced from 1 to 0.  Total controls mapped: 31 (23 implemented, 8 partial/supportive, 0 gaps).
 
 ### v0.2.0 (2026-02-23) — Rate Limiting & Circuit Breaker
 

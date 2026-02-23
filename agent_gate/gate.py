@@ -28,6 +28,7 @@ from agent_gate.classifier_base import ActionTier, ClassificationResult
 from agent_gate.classifier import PythonClassifier, ActionClassifier
 from agent_gate.vault import VaultManager, VaultResult
 from agent_gate.rate_tracker import RateTracker
+from agent_gate.identity import IdentityContext
 
 
 class Verdict(Enum):
@@ -57,6 +58,7 @@ class GateDecision:
     escalation_hint: str = ""
     denial_feedback: str = ""
     rate_status: Optional[dict] = None
+    identity: Optional[dict] = None
 
     def __post_init__(self):
         if not self.timestamp:
@@ -86,6 +88,8 @@ class GateDecision:
         }
         if self.rate_status:
             d["rate_status"] = self.rate_status
+        if self.identity:
+            d["identity"] = self.identity
         return d
 
     def to_agent_message(self) -> str:
@@ -153,16 +157,25 @@ class Gate:
         workdir: str,
         classifier_backend: str = "python",
         opa_config: Optional[dict] = None,
+        identity: Optional[IdentityContext] = None,
     ):
         self.policy = load_policy(policy_path, workdir)
+        self.identity = identity
+
+        # Apply role-based overrides to rate limits
+        self._effective_rate_limits = self._resolve_rate_limits()
+
         self.classifier = self._create_classifier(
             classifier_backend, opa_config
         )
         self.vault = VaultManager(self.policy.vault_config)
         self.logger = self._setup_logger()
 
-        # Rate tracker (optional — only active if policy has rate_limits).
-        self.rate_tracker = RateTracker(self.policy.rate_limits)
+        # Rate tracker uses effective (role-merged) rate limits.
+        self.rate_tracker = RateTracker(self._effective_rate_limits)
+
+        # Apply role-based gate behavior overrides
+        self._effective_gate_behavior = self._resolve_gate_behavior()
 
         self.logger.info(json.dumps({
             "event": "gate_initialized",
@@ -170,8 +183,75 @@ class Gate:
             "workdir": workdir,
             "vault": self.policy.vault_config["path"],
             "classifier_backend": classifier_backend,
+            "identity": (
+                self.identity.to_dict() if self.identity else None
+            ),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }))
+
+    def _resolve_rate_limits(self) -> dict:
+        """
+        Merge role-based rate limit overrides with base policy.
+
+        If identity has a role and the policy defines overrides
+        for that role, merge them.  Role overrides extend/replace
+        base values, they don't remove them.
+        """
+        base = self.policy.rate_limits.copy()
+        if not self.identity or not self.identity.role:
+            return base
+
+        overrides = self.policy.get_role_overrides(self.identity.role)
+        if not overrides or "rate_limits" not in overrides:
+            return base
+
+        return self._deep_merge(base, overrides["rate_limits"])
+
+    def _resolve_gate_behavior(self) -> dict:
+        """
+        Merge role-based gate behavior overrides with base policy.
+
+        If identity role has action behavior overrides (e.g.,
+        admin gets network: allow), apply them.
+        """
+        base = dict(self.policy.gate_behavior)
+        if not self.identity or not self.identity.role:
+            return base
+
+        overrides = self.policy.get_role_overrides(self.identity.role)
+        if not overrides or "actions" not in overrides:
+            return base
+
+        for tier_name, tier_cfg in overrides["actions"].items():
+            behavior = tier_cfg.get("behavior")
+            if behavior:
+                behavior_key = f"on_{tier_name}"
+                if behavior_key in base:
+                    if isinstance(base[behavior_key], dict):
+                        base[behavior_key] = dict(base[behavior_key])
+                        base[behavior_key]["default"] = behavior
+                    else:
+                        base[behavior_key] = {"default": behavior}
+        return base
+
+    @staticmethod
+    def _deep_merge(base: dict, override: dict) -> dict:
+        """
+        Deep merge override into base.  Override values win.
+        Both dicts are treated as immutable (copies are made).
+        """
+        result = {}
+        for key in set(list(base.keys()) + list(override.keys())):
+            if key in override and key in base:
+                if isinstance(base[key], dict) and isinstance(override[key], dict):
+                    result[key] = Gate._deep_merge(base[key], override[key])
+                else:
+                    result[key] = override[key]
+            elif key in override:
+                result[key] = override[key]
+            else:
+                result[key] = base[key]
+        return result
 
     def _create_classifier(
         self,
@@ -202,7 +282,9 @@ class Gate:
             from agent_gate.opa_classifier import OPAClassifier
             # Merge config sources: explicit > policy > defaults
             config = opa_config or raw.get("classifier", {}).get("opa", {})
-            return OPAClassifier(self.policy, opa_config=config)
+            return OPAClassifier(
+                self.policy, opa_config=config, identity=self.identity,
+            )
 
         else:
             raise ValueError(
@@ -291,11 +373,16 @@ class Gate:
         else:
             decision = self._handle_unclassified(tool_call, classification)
 
-        # Step 7: Record outcome for circuit breaker.
+        # Step 7: Attach identity to decision for downstream consumers.
+        decision.identity = (
+            self.identity.to_dict() if self.identity else None
+        )
+
+        # Step 8: Record outcome for circuit breaker.
         success = decision.verdict == Verdict.ALLOW
         self.rate_tracker.record_outcome(tool_name, success, 0)
 
-        # Step 8: Log the decision.
+        # Step 9: Log the decision.
         self._log_decision(decision)
 
         return decision
@@ -668,7 +755,7 @@ class Gate:
         """
         Network-capable action. Default: escalate for human approval.
         """
-        network_config = self.policy.gate_behavior.get("on_network", {})
+        network_config = self._effective_gate_behavior.get("on_network", {})
         default_action = network_config.get("default", "escalate")
         message = network_config.get(
             "message",
@@ -723,7 +810,7 @@ class Gate:
         self, tool_call: dict, classification: ClassificationResult
     ) -> GateDecision:
         """Unknown action. Default deny with explanation."""
-        default = self.policy.gate_behavior.get("on_unclassified", {})
+        default = self._effective_gate_behavior.get("on_unclassified", {})
         default_action = default.get("default", "deny")
         message = default.get(
             "message",

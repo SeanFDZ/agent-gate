@@ -25,6 +25,7 @@ if AGENT_GATE_ROOT not in sys.path:
     sys.path.insert(0, AGENT_GATE_ROOT)
 
 from agent_gate.gate import Gate, Verdict
+from agent_gate.identity import resolve_identity
 
 # --- Configuration ---
 POLICY_PATH = os.environ.get(
@@ -32,6 +33,7 @@ POLICY_PATH = os.environ.get(
     os.path.join(AGENT_GATE_ROOT, "policies", "default.yaml"),
 )
 WORKDIR = os.environ.get("AGENT_GATE_WORKDIR", os.getcwd())
+SESSION_ID = os.environ.get("AGENT_GATE_SESSION", None)
 
 
 def split_compound_command(cmd_string):
@@ -62,9 +64,11 @@ def main():
     if not cmd_string.strip():
         sys.exit(0)
 
-    # Initialize the gate (loads policy, classifier, vault)
+    # Initialize identity and gate
+    identity = resolve_identity(session_id=SESSION_ID)
+
     try:
-        gate = Gate(policy_path=POLICY_PATH, workdir=WORKDIR)
+        gate = Gate(policy_path=POLICY_PATH, workdir=WORKDIR, identity=identity)
     except Exception as e:
         # If gate can't initialize, fail closed
         print(

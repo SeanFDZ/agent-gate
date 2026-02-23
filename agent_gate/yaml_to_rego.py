@@ -342,6 +342,91 @@ any_rate_limit_active if { global_rate_exceeded }"""
 
 
 # =========================================================================
+# IDENTITY / RBAC GENERATORS
+# =========================================================================
+
+
+def generate_identity_data(policy: dict) -> str:
+    """Generate Rego data objects from the identity.roles section.
+
+    Emits role definitions with their override configurations
+    so Rego policies can differentiate by input.identity.role.
+    """
+    identity = policy.get("identity", {})
+    roles = identity.get("roles", {})
+
+    if not roles:
+        return "# No identity roles defined\nidentity_roles := {}"
+
+    lines = []
+    lines.append("# Identity role definitions")
+    lines.append("identity_roles := {")
+    for role_name, role_config in roles.items():
+        lines.append(f'    "{_escape_rego(role_name)}": {{')
+
+        # Actions overrides
+        actions = role_config.get("actions", {})
+        if actions:
+            lines.append('        "actions": {')
+            for tier, cfg in actions.items():
+                behavior = cfg.get("behavior", "")
+                lines.append(
+                    f'            "{_escape_rego(tier)}": '
+                    f'{{"behavior": "{_escape_rego(behavior)}"}},')
+            lines.append('        },')
+
+        # Rate limit overrides
+        rl = role_config.get("rate_limits", {})
+        if rl:
+            lines.append('        "rate_limits": {')
+            for scope, cfg in rl.items():
+                max_calls = cfg.get("max_calls", 0)
+                window = cfg.get("window_seconds", 60)
+                lines.append(
+                    f'            "{_escape_rego(scope)}": '
+                    f'{{"max_calls": {max_calls}, '
+                    f'"window_seconds": {window}}},')
+            lines.append('        },')
+
+        lines.append("    },")
+    lines.append("}")
+
+    return "\n".join(lines)
+
+
+def generate_identity_rules() -> str:
+    """Generate Rego rules for identity-based policy evaluation.
+
+    These rules check input.identity.role against identity_roles
+    data to determine role-specific behavior overrides.
+    """
+    return '''\
+# Identity: check if current role has an override for a tier
+role_has_override(tier_name) if {
+    input.identity
+    input.identity.role
+    role_config := identity_roles[input.identity.role]
+    role_config.actions[tier_name]
+}
+
+# Identity: get the behavior override for a tier
+role_behavior(tier_name) := behavior if {
+    input.identity
+    input.identity.role
+    role_config := identity_roles[input.identity.role]
+    behavior := role_config.actions[tier_name].behavior
+}
+
+# Identity: check if role has rate limit override
+role_rate_limit(scope) := config if {
+    input.identity
+    input.identity.role
+    role_config := identity_roles[input.identity.role]
+    config := role_config.rate_limits[scope]
+}'''
+
+
+# =========================================================================
 # STATIC REGO TEMPLATES
 # =========================================================================
 
@@ -629,21 +714,224 @@ default decision := {
 }"""
 
 
-def generate_decision_rules(has_rate_limits: bool) -> str:
-    """Generate the decision rules, conditionally including rate limits.
+DECISION_RULES_IDENTITY_NETWORK = """\
+
+# Priority 3.5: Identity override — role-based network allow
+decision := result if {
+    all_paths_in_envelope
+    count(blocked_result) == 0
+    count(destructive_result) == 0
+    some name, pattern in network_result
+    role_has_override("network")
+    role_behavior("network") == "allow"
+    result := {
+        "tier": "network",
+        "reason": concat("", [
+            "Network action allowed for role: ",
+            input.identity.role,
+        ]),
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}"""
+
+DECISION_RULES_IDENTITY_NETWORK_WITH_RATE = """\
+
+# Priority 3.5: Identity override — role-based network allow
+decision := result if {
+    all_paths_in_envelope
+    not any_rate_limit_active
+    count(blocked_result) == 0
+    count(destructive_result) == 0
+    some name, pattern in network_result
+    role_has_override("network")
+    role_behavior("network") == "allow"
+    result := {
+        "tier": "network",
+        "reason": concat("", [
+            "Network action allowed for role: ",
+            input.identity.role,
+        ]),
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}"""
+
+# Network tier rules with identity guard (not role_has_override) to avoid
+# Rego conflict when both identity override and regular rule match.
+DECISION_RULES_TIERS_IDENTITY = """\
+
+# Priority 2: Blocked tier match
+decision := result if {
+    all_paths_in_envelope
+    some name, pattern in blocked_result
+    result := {
+        "tier": "blocked",
+        "reason": pattern.description,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 3: Destructive tier match (only if not blocked)
+decision := result if {
+    all_paths_in_envelope
+    count(blocked_result) == 0
+    some name, pattern in destructive_result
+    result := {
+        "tier": "destructive",
+        "reason": pattern.description,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 4: Network tier (only if not blocked or destructive, no identity override)
+decision := result if {
+    all_paths_in_envelope
+    count(blocked_result) == 0
+    count(destructive_result) == 0
+    some name, pattern in network_result
+    not role_has_override("network")
+    result := {
+        "tier": "network",
+        "reason": pattern.description,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 5: Read-only (only if nothing higher matched)
+decision := result if {
+    all_paths_in_envelope
+    count(blocked_result) == 0
+    count(destructive_result) == 0
+    count(network_result) == 0
+    some name, pattern in read_only_result
+    result := {
+        "tier": "read_only",
+        "reason": "Read-only action within envelope",
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 6: Unclassified (nothing matched)
+default decision := {
+    "tier": "unclassified",
+    "reason": "No matching pattern in policy. Requires human review.",
+    "paths_in_envelope": true,
+    "paths_outside_envelope": [],
+    "matched_pattern": null,
+}"""
+
+DECISION_RULES_TIERS_WITH_RATE_AND_IDENTITY = """\
+
+# Priority 2: Blocked tier match (rate limits take precedence)
+decision := result if {
+    all_paths_in_envelope
+    not any_rate_limit_active
+    some name, pattern in blocked_result
+    result := {
+        "tier": "blocked",
+        "reason": pattern.description,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 3: Destructive tier match (only if not blocked)
+decision := result if {
+    all_paths_in_envelope
+    not any_rate_limit_active
+    count(blocked_result) == 0
+    some name, pattern in destructive_result
+    result := {
+        "tier": "destructive",
+        "reason": pattern.description,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 4: Network tier (only if not blocked or destructive, no identity override)
+decision := result if {
+    all_paths_in_envelope
+    not any_rate_limit_active
+    count(blocked_result) == 0
+    count(destructive_result) == 0
+    some name, pattern in network_result
+    not role_has_override("network")
+    result := {
+        "tier": "network",
+        "reason": pattern.description,
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 5: Read-only (only if nothing higher matched)
+decision := result if {
+    all_paths_in_envelope
+    not any_rate_limit_active
+    count(blocked_result) == 0
+    count(destructive_result) == 0
+    count(network_result) == 0
+    some name, pattern in read_only_result
+    result := {
+        "tier": "read_only",
+        "reason": "Read-only action within envelope",
+        "paths_in_envelope": true,
+        "paths_outside_envelope": [],
+        "matched_pattern": pattern,
+    }
+}
+
+# Priority 6: Unclassified (nothing matched)
+default decision := {
+    "tier": "unclassified",
+    "reason": "No matching pattern in policy. Requires human review.",
+    "paths_in_envelope": true,
+    "paths_outside_envelope": [],
+    "matched_pattern": null,
+}"""
+
+
+def generate_decision_rules(has_rate_limits: bool, has_identity: bool = False) -> str:
+    """Generate the decision rules, conditionally including rate limits and identity.
 
     When has_rate_limits is True, rate limit decision rules are inserted
     between the envelope violation check and the blocked tier check.
     The tier rules include a not any_rate_limit_active guard so that
     rate limit decisions take precedence without conflict.
-    When False, the output is identical to the previous static string.
+
+    When has_identity is True, identity override rules are inserted
+    before the regular network rule, and the regular network rule
+    gets a not role_has_override guard to avoid Rego conflicts.
     """
     parts = [DECISION_RULES_ENVELOPE]
     if has_rate_limits:
         parts.append(DECISION_RULES_RATE_LIMIT)
-        parts.append(DECISION_RULES_TIERS_WITH_RATE)
+        if has_identity:
+            parts.append(DECISION_RULES_IDENTITY_NETWORK_WITH_RATE)
+            parts.append(DECISION_RULES_TIERS_WITH_RATE_AND_IDENTITY)
+        else:
+            parts.append(DECISION_RULES_TIERS_WITH_RATE)
     else:
-        parts.append(DECISION_RULES_TIERS)
+        if has_identity:
+            parts.append(DECISION_RULES_IDENTITY_NETWORK)
+            parts.append(DECISION_RULES_TIERS_IDENTITY)
+        else:
+            parts.append(DECISION_RULES_TIERS)
     return "".join(parts)
 
 
@@ -739,8 +1027,23 @@ def generate_rego(policy: dict, source_file: str = "policy.yaml") -> str:
         sections.append(generate_rate_limit_data(rate_limits))
         sections.append(generate_rate_limit_rules())
 
-    # 7. Decision rules (conditionally includes rate limit decisions)
-    sections.append(generate_decision_rules(has_rate_limits=bool(rate_limits)))
+    # 6.7. Identity / RBAC (if present)
+    identity = policy.get("identity", {})
+    identity_roles = identity.get("roles", {})
+    has_identity = bool(identity_roles)
+    sections.append(
+        "# =========================================================================\n"
+        "# IDENTITY / RBAC\n"
+        "# ========================================================================="
+    )
+    sections.append(generate_identity_data(policy))
+    sections.append(generate_identity_rules())
+
+    # 7. Decision rules (conditionally includes rate limit and identity decisions)
+    sections.append(generate_decision_rules(
+        has_rate_limits=bool(rate_limits),
+        has_identity=has_identity,
+    ))
 
     return "\n\n".join(sections) + "\n"
 
@@ -1024,6 +1327,63 @@ def generate_test_scaffold(policy: dict) -> str:
         rl_lines.append("}")
 
         parts.append("\n".join(rl_lines))
+
+    # --- Identity / RBAC tests ---
+    identity = policy.get("identity", {})
+    roles = identity.get("roles", {})
+    if roles:
+        identity_lines = [
+            "# =========================================================================",
+            "# IDENTITY / RBAC TESTS",
+            "# =========================================================================",
+            "",
+            "# Helper: build input with identity",
+            "make_identity_input(cmd, args, paths, role) := {",
+            '    "command": cmd,',
+            '    "args": args,',
+            '    "target_paths": paths,',
+            '    "tool": "bash",',
+            '    "raw_input": {},',
+            '    "envelope": mock_envelope,',
+            '    "identity": {"role": role, "operator": "test"},',
+            "}",
+        ]
+
+        # Add tests for each role with action overrides
+        for role_name, role_config in roles.items():
+            actions_overrides = role_config.get("actions", {})
+            for tier_name, tier_cfg in actions_overrides.items():
+                behavior = tier_cfg.get("behavior", "")
+                if tier_name == "network" and behavior == "allow":
+                    # Network allow test — use a network command
+                    test_name = _dedup_name(
+                        f"test_{role_name}_network_allow", used_names
+                    )
+                    identity_lines.append("")
+                    identity_lines.append(f"{test_name} if {{")
+                    identity_lines.append(
+                        f'    d := decision with input as '
+                        f'make_identity_input("curl", '
+                        f'["https://example.com"], '
+                        f'["/workspace/x"], "{_escape_rego(role_name)}")'
+                    )
+                    identity_lines.append('    d.tier == "network"')
+                    identity_lines.append(
+                        f'    contains(d.reason, "{_escape_rego(role_name)}")'
+                    )
+                    identity_lines.append("}")
+
+        # Test that no-identity input still works normally
+        identity_lines.append("")
+        identity_lines.append("test_no_identity_network_escalate if {")
+        identity_lines.append(
+            '    d := decision with input as make_input("curl", '
+            '["https://example.com"], ["/workspace/x"])'
+        )
+        identity_lines.append('    d.tier == "network"')
+        identity_lines.append("}")
+
+        parts.append("\n".join(identity_lines))
 
     # --- Unclassified test ---
     parts.append(

@@ -56,6 +56,11 @@ class AuditRecord:
     rate_context: Optional[dict] = None   # Rate tracking state at time of decision
     prev_hash: Optional[str] = None   # SHA-256 hash of previous record (chain link)
     record_hash: Optional[str] = None  # SHA-256 hash of this record's content
+    # Identity fields (Phase 6.4) — bind identity to every decision
+    operator: Optional[str] = None         # Human who launched/authorized the agent
+    agent_id: Optional[str] = None         # Unique agent instance identifier
+    service_account: Optional[str] = None  # Service-level identity (CI, deploy)
+    role: Optional[str] = None             # Role for RBAC policy differentiation
 
     def _content_for_hashing(self) -> str:
         """
@@ -202,6 +207,10 @@ class AuditLogger:
         duration_ms: Optional[float] = None,
         policy_hash: Optional[str] = None,
         rate_context: Optional[dict] = None,
+        operator: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        service_account: Optional[str] = None,
+        role: Optional[str] = None,
     ) -> None:
         """
         Convenience method to log a tool call with common fields.
@@ -221,6 +230,10 @@ class AuditLogger:
             duration_ms=duration_ms,
             policy_hash=policy_hash,
             rate_context=rate_context,
+            operator=operator,
+            agent_id=agent_id,
+            service_account=service_account,
+            role=role,
         )
         self.log(record)
 

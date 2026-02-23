@@ -73,8 +73,9 @@ class OPAClassifier(ClassifierBase):
         "unclassified": ActionTier.UNCLASSIFIED,
     }
 
-    def __init__(self, policy: Policy, opa_config: Optional[dict] = None):
+    def __init__(self, policy: Policy, opa_config: Optional[dict] = None, identity=None):
         super().__init__(policy)
+        self.identity = identity  # Optional IdentityContext
 
         # OPA configuration — from policy or explicit
         self.opa_config = opa_config or self._extract_opa_config(policy)
@@ -166,8 +167,10 @@ class OPAClassifier(ClassifierBase):
         This is the structured data that Rego policies evaluate.
         It contains the pre-processed tool call data plus envelope
         configuration so OPA can do envelope checking in Rego.
+
+        Now includes identity context if available.
         """
-        return {
+        doc = {
             "command": command,
             "args": args,
             "target_paths": target_paths,
@@ -178,6 +181,12 @@ class OPAClassifier(ClassifierBase):
                 "denied_paths": self.policy.denied_paths,
             },
         }
+
+        # Add identity if available
+        if self.identity and self.identity.has_identity():
+            doc["identity"] = self.identity.to_dict()
+
+        return doc
 
     def _eval_subprocess(self, input_doc: dict) -> dict:
         """

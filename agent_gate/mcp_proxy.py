@@ -66,6 +66,7 @@ from agent_gate.mcp_jsonrpc import (
 )
 from agent_gate.proxy_config import ProxyConfig, build_config
 from agent_gate.audit import AuditLogger
+from agent_gate.identity import IdentityContext, resolve_identity
 
 # Import Gate — the core evaluation engine
 from agent_gate.gate import Gate, Verdict
@@ -197,6 +198,7 @@ class MCPProxy:
         self.config = config or build_config()
         self.server_name = server_name or self._infer_server_name()
         self.session_id = str(uuid.uuid4())[:8]
+        self.identity = self._resolve_identity()
         self.gate: Optional[Gate] = None
         self.server: Optional[ServerProcess] = None
         self.audit: Optional[AuditLogger] = None
@@ -208,6 +210,33 @@ class MCPProxy:
             if "server-" in part or "mcp-" in part:
                 return part.split("/")[-1]
         return self.server_command[0] if self.server_command else "unknown"
+
+    def _resolve_identity(self) -> IdentityContext:
+        """Resolve identity for this proxy session."""
+        identity_fields = self._read_identity_config()
+        return resolve_identity(
+            identity_config=identity_fields,
+            session_id=self.session_id,
+        )
+
+    def _read_identity_config(self) -> Optional[dict]:
+        """
+        Read the identity.fields section from the policy YAML.
+
+        Lightweight read before full policy validation in _init_gate().
+        Returns None if no identity section exists.
+        """
+        try:
+            import yaml
+            policy_path = self.config.policy
+            if policy_path and os.path.exists(policy_path):
+                with open(policy_path, "r") as f:
+                    raw = yaml.safe_load(f)
+                if isinstance(raw, dict):
+                    return raw.get("identity", {}).get("fields")
+        except Exception:
+            pass
+        return None
 
     def _init_gate(self) -> bool:
         """
@@ -223,8 +252,13 @@ class MCPProxy:
 
         try:
             kwargs = self.config.to_gate_kwargs()
+            kwargs["identity"] = self.identity
             self.gate = Gate(**kwargs)
-            _log(f"Gate initialized (backend={self.config.classifier_backend})")
+            _log(
+                f"Gate initialized "
+                f"(backend={self.config.classifier_backend}, "
+                f"identity={self.identity.display_name})"
+            )
             return True
         except Exception as e:
             _log(f"Failed to initialize gate: {e}")
@@ -235,12 +269,13 @@ class MCPProxy:
         self.audit = AuditLogger(
             path=self.config.audit_log,
             server_name=self.server_name,
-            session_id=self.session_id,
+            session_id=self.identity.session_id or self.session_id,
         )
         self.audit.log_proxy_event("proxy_started", {
             "server_command": " ".join(self.server_command),
             "config_source": self.config.config_source,
             "classifier_backend": self.config.classifier_backend,
+            "identity": self.identity.to_dict(),
         })
 
     def _handle_tool_call(self, msg: MCPMessage) -> Optional[dict]:
@@ -310,6 +345,10 @@ class MCPProxy:
                 duration_ms=round(duration_ms, 2),
                 policy_hash=self.gate.policy.policy_hash if self.gate else None,
                 rate_context=rate_ctx,
+                operator=self.identity.operator,
+                agent_id=self.identity.agent_id,
+                service_account=self.identity.service_account,
+                role=self.identity.role,
             )
 
         # Route based on verdict
