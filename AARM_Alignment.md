@@ -1,9 +1,9 @@
 # AARM Alignment Assessment — Agent Gate
 
-**Document version:** 0.4.0
-**Agent Gate version:** 0.4.0 (Phase 7: MODIFY Decision)
+**Document version:** 0.4.1
+**Agent Gate version:** 0.4.1 (Phase 8A: Sub-agent Governance Clarity)
 **AARM Specification version:** v0.1
-**Date:** 2026-02-23
+**Date:** 2026-02-24
 **Status:** Gap analysis — this is NOT a conformance claim
 
 ---
@@ -87,7 +87,7 @@ Agent Gate logs all tool calls to a JSONL audit log with timestamps, tool names,
 
 | AARM Requirement | Agent Gate Status |
 |---|---|
-| Track prior actions | ✅ Audit log records all tool calls with verdicts |
+| Track prior actions | ✅ Audit log records all tool calls with verdicts.  Audit records now optionally include agent hierarchy context (agent_depth, parent_agent_id, inherited_policy) enabling multi-agent session tracking when operators configure AGENT_GATE_DEPTH and AGENT_GATE_PARENT_SESSION. |
 | Append-only log | ✅ JSONL file opened in append mode |
 | Hash-chained entries | ✅ SHA-256 hash chaining — each record includes `prev_hash` and `record_hash` |
 | Session-level context tracking | ⚠️ Rate tracker maintains sliding window counters, circuit breaker state, and backoff history per session; `rate_context` snapshot included in audit records for rate-limited decisions |
@@ -101,6 +101,7 @@ Agent Gate logs all tool calls to a JSONL audit log with timestamps, tool names,
 - `rate_tracker.py`: `RateTracker` maintains per-tool sliding window counters, per-tier aggregate counters, global counter, and three-state circuit breaker — all accumulated across the session
 - `rate_tracker.py`: `get_rate_context()` returns a snapshot of accumulated state for audit records and OPA input
 - `gate.py`: Circuit breaker state and rate limits directly influence authorization decisions — context feeds back into the policy evaluation pipeline
+- `audit.py`: AuditRecord includes optional `agent_depth`, `parent_agent_id`, and `inherited_policy` fields for multi-agent session context when provided by operator configuration.
 
 **Remaining gap:** The accumulated context is operational (call counts, failure rates, timing) rather than semantic (original intent, data sensitivity).  AARM's full R2 envisions context that captures why the user initiated the session and tracks semantic drift from that intent.  Agent Gate's rate context answers "how fast is this agent operating?" but not "is this agent still doing what it was asked to do?"
 
@@ -250,7 +251,7 @@ This is architecturally consistent with Agent Gate's current design philosophy o
 
 Agent Gate writes JSONL audit logs to local files with structured fields designed for downstream consumption.  There is no export mechanism to external telemetry systems, but the data shape is designed for it.
 
-**Starting point:** The JSONL records include structured fields (timestamp, tool name, verdict, tier, policy_hash, rate_context, duration_ms) that map to common SIEM event schemas.  The `rate_context` snapshots include counter values, breaker state, and limit configurations — the kind of operational telemetry that SIEM/SOAR platforms consume for anomaly detection and alerting.  The gap is in transport (no syslog, no webhook, no OpenTelemetry export) and in schema compliance (no CEF, no OCSF mapping).
+**Starting point:** The JSONL records include structured fields (timestamp, tool name, verdict, tier, policy_hash, rate_context, duration_ms) that map to common SIEM event schemas.  The `rate_context` snapshots include counter values, breaker state, and limit configurations — the kind of operational telemetry that SIEM/SOAR platforms consume for anomaly detection and alerting.  Audit records now carry agent hierarchy context fields (agent_depth, parent_agent_id, inherited_policy), enriching the telemetry available for downstream SIEM/SOAR consumption.  The gap is in transport (no syslog, no webhook, no OpenTelemetry export) and in schema compliance (no CEF, no OCSF mapping).
 
 ---
 
@@ -351,6 +352,15 @@ Agent Gate's vault-backed rollback pattern is not addressed by AARM but represen
 ---
 
 ## Changelog
+
+### v0.4.1 (2026-02-24) — Sub-agent Governance Clarity
+
+Phase 8A established that Agent Gate's enforcement already propagates to sub-agents automatically via hook registration scope and Unix environment inheritance.  Documentation was added to make this explicit.  Audit schema was extended with optional hierarchy fields.
+
+- **R2 (Context Accumulation):** Minor improvement.  AuditRecord now includes optional agent_depth, parent_agent_id, and inherited_policy fields, enabling multi-agent session context in audit records when operators configure AGENT_GATE_DEPTH and AGENT_GATE_PARENT_SESSION in subagent frontmatter.
+- **R8 (Telemetry Export):** Minor improvement.  Audit records now carry richer session context for downstream consumption.  agent-gate tree command added for session hierarchy visualization from audit logs.
+
+AARM Core (R1–R6): Status unchanged from v0.4.0.  No requirement status symbols changed.  Phase 8A additions are incremental evidence within existing assessments.
 
 ### v0.4.0 (2026-02-23) — MODIFY Decision
 

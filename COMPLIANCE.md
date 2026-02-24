@@ -1,8 +1,8 @@
 # Compliance Framework Mapping — Agent Gate
 
-**Document version:** 0.4.0
-**Agent Gate version:** 0.4.0 (Phase 7: MODIFY Decision)
-**Date:** 2026-02-23
+**Document version:** 0.4.1
+**Agent Gate version:** 0.4.1 (Phase 8A: Sub-agent Governance Clarity)
+**Date:** 2026-02-24
 **Status:** Implementation mapping — this is NOT a certification or accreditation claim
 
 ---
@@ -39,8 +39,8 @@ SP 800-53 defines the security control catalog used across federal systems. Agen
 | Control | Title | Agent Gate Mapping | Status |
 |---|---|---|---|
 | **AU-2** | Event Logging | All tool calls through the MCP proxy generate audit records. Allow, deny, escalate, and passthrough events are all logged. Proxy lifecycle events (startup, shutdown, error) are logged separately. | ✅ Implemented |
-| **AU-3** | Content of Audit Records | Each record contains: timestamp (ISO 8601), tool name, arguments, verdict, tier, reason, server name, session ID, message ID, vault path (if applicable), gate evaluation duration in milliseconds, `policy_hash` (SHA-256 of governing policy), and `rate_context` (operational state snapshot on rate-limited decisions). | ✅ Implemented |
-| **AU-3(1)** | Additional Audit Information | Duration of gate evaluation is captured per record. Session IDs link records within a proxy lifecycle. Server names identify which MCP backend was being proxied. | ✅ Implemented |
+| **AU-3** | Content of Audit Records | Each record contains: timestamp (ISO 8601), tool name, arguments, verdict, tier, reason, server name, session ID, message ID, vault path (if applicable), gate evaluation duration in milliseconds, `policy_hash` (SHA-256 of governing policy), `rate_context` (operational state snapshot on rate-limited decisions), `agent_depth` (sub-agent nesting level, when AGENT_GATE_DEPTH is set), `parent_agent_id` (parent session identifier, when AGENT_GATE_PARENT_SESSION is set), `inherited_policy` (bool indicating sub-agent context, when applicable). | ✅ Implemented |
+| **AU-3(1)** | Additional Audit Information | Duration of gate evaluation is captured per record.  Session IDs link records within a proxy lifecycle.  Server names identify which MCP backend was being proxied.  Agent hierarchy context (agent_depth, parent_agent_id, inherited_policy) is now capturable per audit record when operators configure AGENT_GATE_DEPTH and AGENT_GATE_PARENT_SESSION, enabling session-level multi-agent attribution. | ✅ Implemented |
 | **AU-8** | Time Stamps | Timestamps use `datetime.now(timezone.utc).isoformat()` — UTC with timezone designation. | ✅ Implemented |
 | **AU-9** | Protection of Audit Information | The audit log file resides in a configurable path (default: `~/.config/agent-gate/audit.jsonl`). The vault directory — which is envelope-denied — protects vault manifests. However, the audit log file itself is not in the vault and could theoretically be modified by an agent with sufficient file system access. | ⚠️ Partial |
 | **AU-9(3)** | Cryptographic Protection of Audit Information | SHA-256 hash chaining implemented.  Each audit record includes `prev_hash` (hash of previous record) and `record_hash` (hash of current record content), creating a tamper-evident chain from a deterministic genesis value.  `verify_chain()` walks the log and detects any modification, insertion, or deletion.  Records also include `policy_hash` binding each decision to the governing policy version.  Records are not yet signed with a cryptographic key. | ⚠️ Partial |
@@ -106,7 +106,7 @@ The AI RMF defines four functions: Govern, Map, Measure, and Manage. Agent Gate 
 
 | Subcategory | Description | Agent Gate Mapping | Status |
 |---|---|---|---|
-| **MP-2.3** | Scientific integrity and TEVV considerations are identified and documented | Agent Gate's test suite (428+ passing across twenty-four test suites) provides evidence of systematic verification.  Known limitations are documented in the README and this compliance mapping. | ⚠️ Supportive |
+| **MP-2.3** | Scientific integrity and TEVV considerations are identified and documented | Agent Gate's test suite (444+ passing across twenty-four test suites) provides evidence of systematic verification.  Known limitations are documented in the README and this compliance mapping. | ⚠️ Supportive |
 
 ### MEASURE
 
@@ -151,7 +151,7 @@ M-24-10 establishes requirements for federal agencies deploying AI. Agent Gate a
 | M-24-10 Requirement | Agent Gate Mapping | Status |
 |---|---|---|
 | **§5(c)(i)(A)** — Complete an AI impact assessment before deployment | Tiered classification and the policy definition process function as a structured impact assessment at the tool call level — defining what the agent can do, what requires backup, and what is prohibited. | ⚠️ Supportive |
-| **§5(c)(i)(B)** — Conduct testing prior to deployment and on a regular basis | 428+ tests across twenty-four suites, including integration tests against real MCP servers.  OPA backend has formal Rego policy tests including rate limit threshold tests.  Test infrastructure is included in the repository for ongoing testing. | ✅ Implemented |
+| **§5(c)(i)(B)** — Conduct testing prior to deployment and on a regular basis | 444+ tests across twenty-four suites, including integration tests against real MCP servers.  OPA backend has formal Rego policy tests including rate limit threshold tests.  Test infrastructure is included in the repository for ongoing testing. | ✅ Implemented |
 | **§5(c)(i)(D)** — Independently evaluate the AI before deployment | Agent Gate's enforcement is deterministic and fully testable. Policy evaluation can be independently verified by providing a tool call and confirming the expected verdict — no model inference or non-deterministic behavior is involved. | ✅ Implemented |
 | **§5(c)(ii)(A)** — Implement adequate human oversight | Escalation verdict routes actions that exceed the policy envelope to human operators. Network actions default to escalation. Unclassified actions default to denial with instructions for human review. | ✅ Implemented |
 | **§5(c)(ii)(B)** — Halt AI operations in cases of imminent risk | Blocked tier actions are unconditionally denied.  If the vault backup fails and policy specifies `on_failure: deny`, the destructive action is halted.  The circuit breaker automatically halts non-read operations when failure rates exceed configurable thresholds, transitioning the agent to read-only mode.  All halt mechanisms are deterministic — no confidence threshold or model judgment is involved. | ✅ Implemented |
@@ -207,6 +207,18 @@ The [AARM Alignment Assessment](AARM_Alignment.md) covers Agent Gate's mapping t
 ---
 
 ## Changelog
+
+### v0.4.1 (2026-02-24) — Sub-agent Governance Clarity
+
+Phase 8A confirmed that Agent Gate's enforcement propagates to sub-agents automatically and added documentation, optional audit hierarchy fields, and a CLI tree command.
+
+**Controls updated:**
+- **AU-3** — Field list expanded: agent_depth, parent_agent_id, inherited_policy added as optional fields populated from operator-configured environment variables.
+- **AU-3(1)** — Agent hierarchy context now capturable per record for multi-agent session attribution.
+
+**Test count:** 428+ → 444+ (7 new audit hierarchy tests, 9 new CLI tree tests).
+
+**Net effect:** SP 800-53 controls mapped: 32 (24 implemented, 8 partial/supportive, 0 gaps).  No status symbols changed.  Phase 8A additions are incremental evidence within existing control mappings.
 
 ### v0.4.0 (2026-02-23) — MODIFY Decision
 
