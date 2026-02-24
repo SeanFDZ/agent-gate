@@ -16,6 +16,7 @@ verify that the proposed action falls within the authority envelope.
 
 import json
 import logging
+import os
 import shlex
 from datetime import datetime, timezone
 from pathlib import Path
@@ -183,6 +184,17 @@ class Gate:
     ):
         self.policy = load_policy(policy_path, workdir)
         self.identity = identity
+
+        # Sub-agent hierarchy context (optional, Phase 8A)
+        # Set AGENT_GATE_DEPTH and AGENT_GATE_PARENT_SESSION in subagent frontmatter
+        # to capture hierarchy in audit records.  See integrations/claude_code/README.md.
+        raw_depth = os.environ.get("AGENT_GATE_DEPTH", "0")
+        try:
+            self.agent_depth = int(raw_depth)
+        except ValueError:
+            self.agent_depth = 0
+        self.parent_session_id = os.environ.get("AGENT_GATE_PARENT_SESSION", None)
+        self.inherited_policy = self.agent_depth > 0 or None
 
         # Apply role-based overrides to rate limits
         self._effective_rate_limits = self._resolve_rate_limits()
@@ -986,6 +998,11 @@ class Gate:
 
         log_entry = decision.to_dict()
         log_entry["policy_hash"] = self.policy.policy_hash
+
+        if self.agent_depth > 0:
+            log_entry["agent_depth"] = self.agent_depth
+            log_entry["parent_agent_id"] = self.parent_session_id
+            log_entry["inherited_policy"] = True
 
         if decision.classification.tier == ActionTier.RATE_LIMITED:
             log_entry["rate_context"] = self.rate_tracker.get_rate_context()

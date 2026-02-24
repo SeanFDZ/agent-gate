@@ -66,6 +66,12 @@ class AuditRecord:
     modified_tool_call: Optional[dict] = None    # Rewritten call forwarded to server
     modification_rule: Optional[dict] = None     # {rule_id, description, operations_applied}
     reinvocation_verdict: Optional[str] = None   # Verdict from second gate evaluation
+    # Sub-agent hierarchy fields (Phase 8A)
+    # Populated from AGENT_GATE_DEPTH and AGENT_GATE_PARENT_SESSION env vars when set.
+    # Absent from audit records when not configured — no additional setup required.
+    agent_depth: Optional[int] = None
+    parent_agent_id: Optional[str] = None
+    inherited_policy: Optional[bool] = None
 
     def _content_for_hashing(self) -> str:
         """
@@ -221,6 +227,10 @@ class AuditLogger:
         modified_tool_call: Optional[dict] = None,
         modification_rule: Optional[dict] = None,
         reinvocation_verdict: Optional[str] = None,
+        # Sub-agent hierarchy fields (Phase 8A)
+        agent_depth: Optional[int] = None,
+        parent_agent_id: Optional[str] = None,
+        inherited_policy: Optional[bool] = None,
     ) -> None:
         """
         Convenience method to log a tool call with common fields.
@@ -248,6 +258,9 @@ class AuditLogger:
             modified_tool_call=modified_tool_call,
             modification_rule=modification_rule,
             reinvocation_verdict=reinvocation_verdict,
+            agent_depth=agent_depth,
+            parent_agent_id=parent_agent_id,
+            inherited_policy=inherited_policy,
         )
         self.log(record)
 

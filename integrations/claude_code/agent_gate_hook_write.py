@@ -32,6 +32,12 @@ POLICY_PATH = os.environ.get(
 WORKDIR = os.environ.get("AGENT_GATE_WORKDIR", os.getcwd())
 SESSION_ID = os.environ.get("AGENT_GATE_SESSION", None)
 
+# Sub-agent hierarchy context is read directly from the environment by gate.py.
+# To capture hierarchy in audit records, set these in subagent frontmatter hooks:
+#   AGENT_GATE_DEPTH=1
+#   AGENT_GATE_PARENT_SESSION=${AGENT_GATE_SESSION}
+# See integrations/claude_code/README.md "Sub-agent Governance" for details.
+
 
 def main():
     # Read hook input from stdin (Claude Code's PreToolUse format)

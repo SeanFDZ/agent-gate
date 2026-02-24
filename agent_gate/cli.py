@@ -16,11 +16,120 @@ Usage:
 import argparse
 import json
 import sys
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
 from agent_gate.vault import VaultManager
+
+
+def cmd_tree(args):
+    """Show agent session hierarchy from audit log."""
+    log_path = Path(args.log)
+    if not log_path.exists():
+        print(f"Log file not found: {args.log}")
+        return
+
+    # Parse all lines
+    records = []
+    malformed_count = 0
+    no_agent_id_count = 0
+
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                malformed_count += 1
+                continue
+            if not rec.get("agent_id"):
+                no_agent_id_count += 1
+                continue
+            records.append(rec)
+
+    # Check if session exists
+    root_id = args.session_id
+    root_records = [r for r in records if r["agent_id"] == root_id]
+    if not root_records:
+        print(f"Session '{root_id}' not found in log.")
+        return
+
+    # Build node dict keyed by agent_id
+    nodes = {}
+    for rec in records:
+        aid = rec["agent_id"]
+        if aid not in nodes:
+            nodes[aid] = {
+                "agent_id": aid,
+                "agent_depth": rec.get("agent_depth", 0),
+                "inherited_policy": rec.get("inherited_policy", False),
+                "children": [],
+                "verdicts": Counter(),
+            }
+        nodes[aid]["verdicts"][rec.get("verdict", "unknown")] += 1
+
+    # Build parent-child links
+    for rec in records:
+        parent = rec.get("parent_agent_id")
+        child = rec["agent_id"]
+        if parent and parent in nodes and child != parent:
+            if child not in nodes[parent]["children"]:
+                nodes[parent]["children"].append(child)
+
+    # Print tree recursively
+    def print_node(node_id, prefix="", is_last=True, is_root=True):
+        node = nodes.get(node_id)
+        if node is None:
+            return
+
+        depth = node["agent_depth"]
+        if depth is None:
+            depth = 0
+
+        if is_root:
+            label = f"Session: {node_id}  depth={depth}"
+            print(label)
+        else:
+            connector = "\u2514\u2500\u2500" if is_last else "\u251c\u2500\u2500"
+            inh = node["inherited_policy"]
+            label = f"Sub-agent: {node_id}  depth={depth}  inherited_policy={inh}"
+            print(f"{prefix}{connector} {label}")
+
+        # Verdict counts line
+        verdicts = node["verdicts"]
+        if verdicts:
+            parts = []
+            for v in sorted(verdicts.keys()):
+                parts.append(f"{v}: {verdicts[v]}")
+            verdict_str = "  ".join(parts)
+            if is_root:
+                print(f"  {verdict_str}")
+            else:
+                continuation = "\u2502" if not is_last else " "
+                print(f"{prefix}{continuation}     {verdict_str}")
+
+        # Recurse into children
+        children = node["children"]
+        for i, child_id in enumerate(children):
+            child_is_last = (i == len(children) - 1)
+            if is_root:
+                child_prefix = "  "
+            else:
+                continuation = "\u2502" if not is_last else " "
+                child_prefix = prefix + continuation + "   "
+            print_node(child_id, prefix=child_prefix, is_last=child_is_last, is_root=False)
+
+    print_node(root_id)
+
+    # Summary
+    if no_agent_id_count > 0:
+        print(f"{no_agent_id_count} records have no hierarchy context (set AGENT_GATE_DEPTH to enable).")
+    if malformed_count > 0:
+        print(f"{malformed_count} lines skipped (malformed JSON).")
 
 
 def get_vault_manager(vault_path: Optional[str] = None) -> VaultManager:
@@ -320,6 +429,21 @@ def main():
         "-y", "--yes", action="store_true", help="Skip confirmation"
     )
 
+    # tree
+    tree_parser = subparsers.add_parser(
+        "tree",
+        help="Show agent session hierarchy from audit log"
+    )
+    tree_parser.add_argument(
+        "session_id",
+        help="Root session ID to display (matches agent_id field in audit records)"
+    )
+    tree_parser.add_argument(
+        "--log",
+        default=str(Path.home() / ".config" / "agent-gate" / "logs" / "gate.jsonl"),
+        help="Path to gate audit log (default: ~/.config/agent-gate/logs/gate.jsonl)"
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -332,6 +456,7 @@ def main():
         "restore": cmd_restore,
         "diff": cmd_diff,
         "purge": cmd_purge,
+        "tree": cmd_tree,
     }
 
     commands[args.command](args)
