@@ -35,6 +35,11 @@ class Policy:
         self._resolve_variables()
         self._validate()
 
+        # Absolute path to the YAML file this policy was loaded from.
+        # Set by load_policy() after construction.  Used by the
+        # classifier to hardcode-protect the policy file from agent writes.
+        self.source_path: Optional[str] = None
+
         # Parsed and ready for runtime lookup
         self.name = self._raw["gate"]["name"]
         self.description = self._raw["gate"]["description"]
@@ -582,4 +587,6 @@ def load_policy(policy_path: str, workdir: str) -> Policy:
     if not isinstance(raw, dict):
         raise PolicyValidationError("Policy file must contain a YAML mapping")
 
-    return Policy(raw, workdir)
+    policy = Policy(raw, workdir)
+    policy.source_path = str(policy_path.resolve())
+    return policy

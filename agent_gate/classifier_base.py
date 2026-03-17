@@ -136,6 +136,22 @@ class ClassifierBase(ABC):
 
         target_paths = self._extract_target_paths(command, args, tool_call)
 
+        # Hardcoded protection for Agent Gate configuration files.
+        # This cannot be overridden by policy — the gate must not allow
+        # the agent to modify its own config.
+        for path in target_paths:
+            if self._is_protected_path(path):
+                return ClassificationResult(
+                    tier=ActionTier.BLOCKED,
+                    command=command,
+                    args=args,
+                    target_paths=target_paths,
+                    reason=(
+                        "Protected file: Agent Gate configuration "
+                        "cannot be modified by the agent."
+                    ),
+                )
+
         # Delegate to backend for envelope check + tier matching
         return self._evaluate(command, args, target_paths, tool_call)
 
@@ -267,7 +283,39 @@ class ClassifierBase(ABC):
                         f"gate cannot inspect the piped code"
                     )
 
+        # Shell redirect operators: >, >>, 2>, 1>, &>
+        # Redirects produce file-write side effects that the gate cannot
+        # track or envelope-check.  Same principle as variable expansion:
+        # if the gate cannot fully evaluate the command's effects, deny it.
+        redir_check = re.sub(r'"[^"]*"', '', stripped)
+        # Remove test/bracket expressions where > is a string comparison.
+        redir_check = re.sub(r'\[\[.*?\]\]', '', redir_check)
+        redir_check = re.sub(r'\[.*?\]', '', redir_check)
+        if re.search(r'>', redir_check):
+            return (
+                "contains shell redirect (> or >>).  "
+                "Use write_file for file writes so the gate can "
+                "inspect the target path."
+            )
+
         return None  # Command is literal
+
+    def _is_protected_path(self, path: str) -> bool:
+        """
+        Check whether a resolved path is a protected Agent Gate file.
+
+        This is a hardcoded safety check that cannot be overridden by
+        policy configuration.  The gate must not allow the agent to
+        modify its own configuration.
+        """
+        basename = os.path.basename(path)
+        if basename in ('.agent-gate.yaml', '.agent-gate.yml'):
+            return True
+        # Check against the loaded policy file path.
+        policy_source = getattr(self.policy, 'source_path', None)
+        if policy_source and os.path.realpath(path) == os.path.realpath(policy_source):
+            return True
+        return False
 
     def _extract_target_paths(
         self, command: str, args: List[str], tool_call: dict
